@@ -17,7 +17,7 @@ class TestParseDesktop(unittest.TestCase):
             "Type=Application\n"
         )
         result = mapping._parse_desktop(content)
-        self.assertEqual(result, ("test application", "test-app --flag"))
+        self.assertEqual(result, ("test application", "test-app --flag", ""))
 
     def test_no_exec(self):
         content = "[Desktop Entry]\nName=Foo\n"
