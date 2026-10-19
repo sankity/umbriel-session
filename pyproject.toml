@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "umbriel-session"
+version = "0.1.0"
+description = "Session save and restore for the Umbriel Wayland compositor"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "sankitsy" }]
+keywords = ["umbriel", "wayland", "session", "compositor"]
+classifiers = [
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Desktop Environment",
+    "Topic :: Utilities",
+]
+requires-python = ">=3.11"
+dependencies = [
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+umbriel-session = "umbriel_session.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
