@@ -10,8 +10,13 @@ import threading
 import time
 
 from .config import Config
-from .session import save_session
-from .session import build_session, parse_compositor_windows, parse_compositor_workspaces
+from .session import (
+    save_session,
+    build_session,
+    parse_compositor_windows,
+    parse_compositor_workspaces,
+    filter_raw_windows,
+)
 from .mapping import resolve_command, build_desktop_map
 from .terminal import get_terminal_cwd
 
@@ -56,6 +61,7 @@ def capture(cfg) -> None:
     """Save the current session once."""
     raw_windows = _query_windows()
     raw_workspaces = _query_workspaces()
+    raw_windows = filter_raw_windows(raw_windows, cfg)
     desktop_map = build_desktop_map()
     entries = parse_compositor_windows(raw_windows)
     for entry in entries:

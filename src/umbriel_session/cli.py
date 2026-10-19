@@ -22,6 +22,7 @@ from .session import (
     build_session,
     clear_all_sessions,
     clear_session,
+    filter_raw_windows,
     list_sessions,
     load_session,
     parse_compositor_windows,
@@ -70,6 +71,7 @@ def _capture_now(cfg, profile: str | None) -> Session:
     _require_compositor()
     raw_windows = _query_windows()
     raw_workspaces = _query_workspaces()
+    raw_windows = filter_raw_windows(raw_windows, cfg)
     desktop_map = build_desktop_map()
     entries = parse_compositor_windows(raw_windows)
     for entry in entries:
