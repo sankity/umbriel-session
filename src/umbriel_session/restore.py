@@ -134,6 +134,9 @@ def restore_session(
     if dry_run:
         return [(w, "DRY_RUN") for w in windows]
 
+    if cfg.restore_delay_seconds > 0:
+        time.sleep(cfg.restore_delay_seconds)
+
     before_windows = snapshot_windows()
     before_ids = set(before_windows)
     before_app_counts: dict[str, int] = {}
