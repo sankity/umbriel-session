@@ -12,8 +12,24 @@ Session save and restore for the [Umbriel](https://github.com/noctalia-dev/umbri
 
 ## Installation
 
+### User-local (no root)
+
 ```bash
-pip install -e .
+./install.sh
+```
+
+### System-wide
+
+```bash
+sudo ./install.sh --system
+# or via pacman:
+makepkg -si
+```
+
+### Development
+
+```bash
+PYTHONPATH=src python3 -m umbriel_session.cli --help
 ```
 
 ## Quick start

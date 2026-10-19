@@ -33,9 +33,10 @@ def _desktop_search_dirs() -> list[Path]:
     return dirs
 
 
-def _parse_desktop(content: str) -> tuple[str, str] | None:
+def _parse_desktop(content: str) -> tuple[str, str, str] | None:
     name = None
     exec_line = None
+    wm_class = None
     in_entry = False
     for line in content.splitlines():
         line = line.strip()
@@ -48,14 +49,16 @@ def _parse_desktop(content: str) -> tuple[str, str] | None:
             name = line.split("=", 1)[1].strip().lower()
         elif line.startswith("Exec="):
             exec_line = line.split("=", 1)[1].strip()
-        if name and exec_line:
+        elif line.startswith("StartupWMClass="):
+            wm_class = line.split("=", 1)[1].strip().lower()
+        if name and exec_line and wm_class:
             break
     if not name or not exec_line:
         return None
     cleaned = _PLACEHOLDER_RE.sub("", exec_line).strip()
     if not cleaned:
         return None
-    return name, cleaned
+    return name, cleaned, wm_class or ""
 
 
 def build_desktop_map() -> dict[str, str]:
@@ -69,10 +72,12 @@ def build_desktop_map() -> dict[str, str]:
                 continue
             if parsed is None:
                 continue
-            name, cmd = parsed
+            name, cmd, wm_class = parsed
             stem = entry.stem.lower()
             mapping.setdefault(stem, cmd)
             mapping.setdefault(name, cmd)
+            if wm_class:
+                mapping.setdefault(wm_class, cmd)
     return mapping
 
 
