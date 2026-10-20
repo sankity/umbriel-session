@@ -267,6 +267,19 @@ def restore_session(
             proc.terminate()
             proc.wait(timeout=5)
 
+    # Final pass: match remaining saved entries to existing windows (apps that
+    # were already running and didn't spawn a new window). Apply their saved
+    # state so already-running apps land on the right workspace.
+    for entry, _cmd in list(pending):
+        for wid, w in before_windows.items():
+            if wid in matched:
+                continue
+            if w.get("app_id", "") == entry.app_id:
+                matched[wid] = entry
+                _remove_pending(pending, entry)
+                _apply_window(entry, wid, cfg)
+                break
+
     # Restore focus to the window that was focused before restore started.
     if original_focus:
         _send(f"window-focus:{original_focus}")
