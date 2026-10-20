@@ -16,10 +16,16 @@ from umbriel_session.models import (
 
 class TestWorkspaceRef(unittest.TestCase):
     def test_from_id_valid(self):
-        ref = workspace_ref_from_id("HDMI-A-1:3")
+        ref = workspace_ref_from_id("HDMI-A-1:3", {"HDMI-A-1:3": 2})
         self.assertEqual(ref.output, "HDMI-A-1")
-        self.assertEqual(ref.index, 3)
+        self.assertEqual(ref.index, 2)
         self.assertFalse(ref.named)
+        self.assertEqual(ref.id, "HDMI-A-1:3")
+
+    def test_from_id_without_index_map(self):
+        # The serial in the id is not the index.
+        ref = workspace_ref_from_id("HDMI-A-1:3")
+        self.assertEqual(ref.index, 0)
 
     def test_from_id_invalid(self):
         self.assertIsNone(workspace_ref_from_id(""))

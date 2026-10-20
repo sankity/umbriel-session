@@ -63,7 +63,7 @@ def capture(cfg) -> None:
     raw_workspaces = _query_workspaces()
     raw_windows = filter_raw_windows(raw_windows, cfg)
     desktop_map = build_desktop_map()
-    entries = parse_compositor_windows(raw_windows)
+    entries = parse_compositor_windows(raw_windows, raw_workspaces)
     for entry in entries:
         entry.cmd = resolve_command(
             entry.app_id, entry.pid, cfg.launch, desktop_map

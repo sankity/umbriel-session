@@ -43,7 +43,6 @@ class Config:
     load_time: float = 60.0
     spawn_interval: float = 0.3
     debounce_seconds: float = 2.0
-    focus_last: bool = True
     restore_scratchpad: bool = False
     restore_xwayland: bool = False
     ignore_classes: set[str] = field(default_factory=set)
@@ -51,6 +50,9 @@ class Config:
         default_factory=lambda: set(DEFAULT_CONTENT_TYPE_IGNORE)
     )
     launch: dict[str, str] = field(default_factory=dict)
+    # Window title -> launch command, for apps whose windows cannot be told
+    # apart by app id or pid (Electron apps share one process).
+    launch_by_title: dict[str, str] = field(default_factory=dict)
     terminal_cwd_flags: dict[str, tuple[str, str]] = field(
         default_factory=lambda: dict(DEFAULT_TERMINAL_CWD_FLAGS)
     )
@@ -87,7 +89,6 @@ def load_config() -> Config:
         "restore_floating",
         "restore_fullscreen",
         "restore_cwd",
-        "focus_last",
         "restore_scratchpad",
         "restore_xwayland",
     ):
@@ -101,6 +102,7 @@ def load_config() -> Config:
         cfg.ignore_content_types = {c.lower() for c in ignore["content_types"]}
 
     cfg.launch = {k.lower(): v for k, v in data.get("launch", {}).items()}
+    cfg.launch_by_title = dict(data.get("launch_by_title", {}))
 
     if "terminal_cwd_flags" in data:
         cfg.terminal_cwd_flags = _parse_terminal_flags(data["terminal_cwd_flags"])

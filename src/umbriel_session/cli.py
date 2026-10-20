@@ -73,7 +73,7 @@ def _capture_now(cfg, profile: str | None) -> Session:
     raw_workspaces = _query_workspaces()
     raw_windows = filter_raw_windows(raw_windows, cfg)
     desktop_map = build_desktop_map()
-    entries = parse_compositor_windows(raw_windows)
+    entries = parse_compositor_windows(raw_windows, raw_workspaces)
     for entry in entries:
         entry.cmd = resolve_command(
             entry.app_id, entry.pid, cfg.launch, desktop_map
@@ -121,12 +121,17 @@ def cmd_restore(args) -> None:
     table.add_column("App")
     table.add_column("Workspace")
     table.add_column("Status")
+    ok_status = ("OK", "DRY_RUN", "RESTORED", "EXISTING")
     for entry, status in report:
-        ok = status in ("OK", "DRY_RUN")
+        colour = "green" if status in ok_status else "yellow"
+        if status == "EXTRA":
+            where = entry.workspace.id
+        else:
+            where = f"{entry.workspace.output}:{entry.workspace.index}"
         table.add_row(
             entry.app_id,
-            f"{entry.workspace.output}:{entry.workspace.index}",
-            f"[green]{status}[/green]" if ok else f"[yellow]{status}[/yellow]",
+            where,
+            f"[{colour}]{status}[/{colour}]",
         )
     console.print(table)
 
@@ -252,7 +257,6 @@ def cmd_config(_args) -> None:
         "load_time = 60\n"
         "spawn_interval = 0.3\n"
         "debounce_seconds = 2.0\n"
-        "focus_last = true\n"
         "\n"
         "[ignore]\n"
         'classes = ["mpv", "vlc", "waybar", "dunst", "hyprpaper", "swaybg", "rofi", "wofi"]\n'

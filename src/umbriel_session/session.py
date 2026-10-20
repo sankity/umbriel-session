@@ -10,7 +10,13 @@ import time
 from pathlib import Path
 
 from .config import BACKUPS_DIR, DATA_DIR
-from .models import Session, WindowEntry, WorkspaceEntry, workspace_ref_from_id
+from .models import (
+    Session,
+    WindowEntry,
+    WorkspaceEntry,
+    WorkspaceRef,
+    workspace_ref_from_id,
+)
 
 log = logging.getLogger(__name__)
 
@@ -128,21 +134,39 @@ def parse_compositor_workspaces(raw: list[dict]) -> list[WorkspaceEntry]:
     return [WorkspaceEntry.from_compositor(w) for w in raw]
 
 
-def parse_compositor_windows(raw: list[dict]) -> list[WindowEntry]:
+def parse_compositor_windows(
+    raw: list[dict], workspaces: list[dict] | None = None
+) -> list[WindowEntry]:
     """Build WindowEntry objects from `umbriel windows --json` output.
 
-    Windows are sorted by focus recency (focused first) and assigned a
+    The workspace list is needed because a window's workspace id carries a
+    serial, not the workspace index. The index shifts when Umbriel prunes an
+    empty dynamic workspace, the serial does not.
+
+    Windows are sorted by focus recency (active first) and assigned a
     focus_order so restore can replay the original focus sequence.
     """
+    ws_info = {w["id"]: w for w in (workspaces or [])}
+
+    # The seat-global activation is `active`; `focused` is per-workspace
+    # memory, so it cannot order the session.
+    ordered = sorted(raw, key=lambda w: (not w.get("active", False), w.get("app_id", "")))
+
     entries = []
-    for w in raw:
-        ref = workspace_ref_from_id(w.get("workspace", ""))
-        if ref is None:
+    for w in ordered:
+        ws_id = w.get("workspace", "")
+        info = ws_info.get(ws_id)
+        if info is None:
             continue
-        entries.append(WindowEntry.from_compositor(w, 0, ref))
-    entries.sort(key=lambda e: (not e.focused, e.app_id))
-    for order, entry in enumerate(entries):
-        entry.focus_order = order
+        ref = WorkspaceRef(
+            output=info.get("output", ""),
+            index=info.get("index", 0),
+            named=info.get("named", False),
+            name=info.get("name", ""),
+            id=ws_id,
+        )
+        entry = WindowEntry.from_compositor(w, len(entries), ref)
+        entries.append(entry)
     return entries
 
 

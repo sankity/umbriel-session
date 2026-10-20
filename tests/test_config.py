@@ -30,14 +30,14 @@ class TestConfig(unittest.TestCase):
             "window_wait_timeout = 5.0\n"
             "restore_floating = false\n"
             "restore_cwd = false\n"
-            "focus_last = false\n"
+            "restore_scratchpad = true\n"
         )
         cfg = config.load_config()
         self.assertEqual(cfg.restore_delay_seconds, 1.5)
         self.assertEqual(cfg.window_wait_timeout, 5.0)
         self.assertFalse(cfg.restore_floating)
         self.assertFalse(cfg.restore_cwd)
-        self.assertFalse(cfg.focus_last)
+        self.assertTrue(cfg.restore_scratchpad)
 
     def test_parse_ignore(self):
         config.CONFIG_FILE.write_text(

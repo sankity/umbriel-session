@@ -6,12 +6,10 @@ import json
 import logging
 import select
 import subprocess
-import threading
 import time
 from pathlib import Path
 
 from .config import Config
-from .mapping import resolve_command
 from .models import Session, WindowEntry
 from .session import load_session
 from .terminal import build_cwd_cmd
@@ -63,15 +61,6 @@ def snapshot_workspaces() -> dict[str, dict]:
     return {w["id"]: w for w in data}
 
 
-def workspace_selector(window: WindowEntry) -> str:
-    ref = window.workspace
-    if ref.named:
-        if ref.output:
-            return f"{ref.name}/{ref.output}"
-        return f'"{ref.name}"'
-    return f"{ref.index}/{ref.output}" if ref.output else str(ref.index)
-
-
 def _ws_key(ws_id: str, ws_map: dict[str, dict]) -> tuple[str, int] | None:
     """Map a live workspace id to the (output, index) pair a saved entry uses."""
     ws = ws_map.get(ws_id)
@@ -84,29 +73,50 @@ def _entry_key(entry: WindowEntry) -> tuple[str, int]:
     return (entry.workspace.output, entry.workspace.index)
 
 
+def workspace_selector(live_ws: dict) -> str:
+    """Selector that addresses a live workspace."""
+    output = live_ws.get("output", "")
+    if live_ws.get("named"):
+        name = live_ws.get("name", "")
+        return f'"{name}"/{output}' if output else f'"{name}"'
+    return f"{live_ws.get('index', 1)}/{output}" if output else str(live_ws.get("index", 1))
+
+
+def resolve_target_workspace(
+    entry: WindowEntry, ws_map: dict[str, dict]
+) -> dict | None:
+    """Find the live workspace a saved entry belongs to.
+
+    A saved index can point past the end of the live inventory when Umbriel
+    pruned an empty dynamic workspace, so the last workspace on that output
+    is the fallback.
+    """
+    on_output = [w for w in ws_map.values() if w.get("output") == entry.workspace.output]
+    if not on_output:
+        return None
+    for w in on_output:
+        if w.get("index") == entry.workspace.index:
+            return w
+    if entry.workspace.named:
+        for w in on_output:
+            if w.get("name") == entry.workspace.name:
+                return w
+    fallback = max(on_output, key=lambda w: w.get("index", 0))
+    log.warning(
+        "workspace %s:%s no longer exists, using %s",
+        entry.workspace.output,
+        entry.workspace.index,
+        fallback.get("id"),
+    )
+    return fallback
+
+
 def _send(action: str) -> bool:
     result = run_umbriel("msg", action)
     if result.returncode != 0:
         log.warning("msg %s failed: %s", action, result.stderr.strip())
         return False
     return True
-
-
-def _match_window(
-    wid: str,
-    windows_by_id: dict[str, dict],
-    pending: list[tuple[WindowEntry, str]],
-) -> tuple[WindowEntry, str] | None:
-    window = windows_by_id.get(wid, {})
-    app_id = window.get("app_id", "")
-    title = window.get("title", "")
-    for entry, cmd in pending:
-        if entry.app_id and entry.app_id == app_id:
-            return entry, cmd
-    for entry, cmd in pending:
-        if entry.title and entry.title == title:
-            return entry, cmd
-    return None
 
 
 def _remove_pending(
@@ -118,37 +128,119 @@ def _remove_pending(
             return
 
 
-def _pick_window(
-    entry: WindowEntry,
-    live: dict[str, dict],
-    matched: dict[str, WindowEntry],
-    ws_map: dict[str, dict],
-) -> str | None:
-    """Pick the live window that belongs to a saved entry.
+def _default_windows(live: dict[str, dict]) -> set[str]:
+    """Windows whose title is a strict suffix of another window of the same app.
 
-    A window already sitting on the entry's workspace is preferred, so the
-    assignment stays stable instead of depending on the order the compositor
-    happens to list windows in.
+    An Electron app's blank window is titled with the app name alone, which
+    is a suffix of the titled windows of the same app. Such a window is a
+    default one and must not claim an entry that carries a distinctive
+    prefix of its own.
     """
-    candidates = [
-        wid
-        for wid, w in live.items()
-        if wid not in matched and w.get("app_id", "") == entry.app_id
-    ]
-    if not candidates:
-        candidates = [
+    defaults: set[str] = set()
+    by_app: dict[str, list[str]] = {}
+    for wid, window in live.items():
+        by_app.setdefault(window.get("app_id", ""), []).append(wid)
+    for wids in by_app.values():
+        titles = {wid: live[wid].get("title", "") for wid in wids}
+        for wid, title in titles.items():
+            if not title:
+                continue
+            for other, other_title in titles.items():
+                if other == wid or not other_title or title == other_title:
+                    continue
+                if title.endswith(other_title) or other_title.endswith(title):
+                    defaults.add(wid if len(title) < len(other_title) else other)
+    return defaults
+
+
+def assign_entries(
+    live: dict[str, dict],
+    pending: list[tuple[WindowEntry, str]],
+    ws_map: dict[str, dict],
+) -> dict[str, WindowEntry]:
+    """Assign live windows to saved entries.
+
+    A title identifies a window inside its app, the workspace identifies it
+    when the title is shared or has changed, and the app id alone is only
+    used when a single entry is left for that app. Every window gets its
+    title tried before any window falls back, so one window without a unique
+    title cannot steal the entry that another window's title identifies.
+    """
+    assignment: dict[str, WindowEntry] = {}
+    remaining = list(pending)
+    defaults = _default_windows(live)
+
+    # A title that matches exactly one entry identifies the window.
+    for wid, window in live.items():
+        title = window.get("title", "")
+        if not title:
+            continue
+        same = [(e, c) for e, c in remaining if e.title == title]
+        if len(same) == 1:
+            assignment[wid] = same[0][0]
+            remaining.remove(same[0])
+
+    # The workspace identifies the window when the title no longer matches.
+    for wid, window in live.items():
+        if wid in assignment:
+            continue
+        live_key = _ws_key(window.get("workspace", ""), ws_map)
+        if live_key is None:
+            continue
+        app_id = window.get("app_id", "")
+        for pair in list(remaining):
+            if pair[0].app_id != app_id or _entry_key(pair[0]) != live_key:
+                continue
+            if wid in defaults and pair[0].title != window.get("title", ""):
+                # A default window only takes an entry titled the same way.
+                continue
+            assignment[wid] = pair[0]
+            remaining.remove(pair)
+            break
+
+    # The app id alone, and only as many windows as there are entries left:
+    # an extra window of an app must not take an entry that a real window of
+    # that app still needs.
+    def distance(wid: str, entry: WindowEntry) -> int:
+        live_key = _ws_key(live[wid].get("workspace", ""), ws_map)
+        target = _entry_key(entry)
+        if live_key is None or live_key[0] != target[0]:
+            return 999
+        return abs(live_key[1] - target[1])
+
+    app_ids = {w.get("app_id", "") for w in live.values()}
+    for app_id in app_ids:
+        waiting = [
             wid
             for wid, w in live.items()
-            if wid not in matched and w.get("title", "") == entry.title
+            if wid not in assignment and w.get("app_id", "") == app_id
         ]
-    if not candidates:
-        return None
-    target = _entry_key(entry)
-    for wid in candidates:
-        live_key = _ws_key(live[wid].get("workspace", ""), ws_map)
-        if live_key is not None and live_key == target:
-            return wid
-    return candidates[0]
+        if not waiting:
+            continue
+        combos = []
+        for wid in waiting:
+            for index, pair in enumerate(remaining):
+                if pair[0].app_id != app_id:
+                    continue
+                if wid in defaults and pair[0].title != live[wid].get("title", ""):
+                    continue
+                combos.append((distance(wid, pair[0]), wid, index))
+        if not combos:
+            continue
+        combos.sort()
+        used_windows: set[str] = set()
+        used_entries: set[int] = set()
+        for _dist, wid, index in combos:
+            if wid in used_windows or index in used_entries:
+                continue
+            used_windows.add(wid)
+            used_entries.add(index)
+            assignment[wid] = remaining[index][0]
+        remaining = [
+            pair for index, pair in enumerate(remaining) if index not in used_entries
+        ]
+
+    return assignment
 
 
 def _apply_window(
@@ -156,7 +248,7 @@ def _apply_window(
     window_id: str,
     current: dict,
     cfg: Config,
-    ws_map: dict[str, dict],
+    target_ws: dict | None,
 ) -> None:
     """Apply the saved state to a live window.
 
@@ -164,20 +256,32 @@ def _apply_window(
     actually needs it: moving the window to its workspace, or a focused-window
     action (fullscreen/maximize/pin).
     """
-    live_key = _ws_key(current.get("workspace", ""), ws_map)
-    on_target = live_key is not None and live_key == _entry_key(entry)
+    on_target = False
+    if target_ws is not None:
+        on_target = current.get("workspace") == target_ws.get("id")
+        on_output = current.get("output") == target_ws.get("output")
 
-    needs_focus = (
-        not on_target
-        or (cfg.restore_fullscreen and entry.fullscreen and not current.get("fullscreen"))
-        or (entry.maximized and not current.get("maximized"))
-        or (entry.pinned and not current.get("pinned"))
-    )
-    if needs_focus:
-        _send(f"window-focus:{window_id}")
+        needs_focus = (
+            not (on_target and on_output)
+            or (cfg.restore_fullscreen and entry.fullscreen and not current.get("fullscreen"))
+            or (entry.maximized and not current.get("maximized"))
+            or (entry.pinned and not current.get("pinned"))
+        )
+        if needs_focus:
+            _send(f"window-focus:{window_id}")
 
-    if not on_target:
-        _send(f"window-move-to-workspace-silent:{workspace_selector(entry)}")
+        if not (on_target and on_output):
+            _send(
+                f"window-move-to-workspace-silent:{workspace_selector(target_ws)}"
+            )
+    else:
+        needs_focus = (
+            (cfg.restore_fullscreen and entry.fullscreen and not current.get("fullscreen"))
+            or (entry.maximized and not current.get("maximized"))
+            or (entry.pinned and not current.get("pinned"))
+        )
+        if needs_focus:
+            _send(f"window-focus:{window_id}")
 
     if cfg.restore_floating and entry.floating != current.get("floating", False):
         _send(f"window-toggle-floating:{window_id}")
@@ -190,6 +294,16 @@ def _apply_window(
         _send("window-toggle-maximize")
     if entry.pinned and not current.get("pinned"):
         _send("window-toggle-pinned")
+
+
+def _spawn_cmd(entry: WindowEntry, cfg: Config) -> str:
+    """Build the command to launch for a saved window."""
+    cmd = cfg.launch_by_title.get(entry.title) or entry.cmd
+    flags = cfg.terminal_cwd_flags.get(entry.app_id.lower())
+    if cfg.restore_cwd and entry.cwd and flags:
+        style, flag = flags
+        cmd = build_cwd_cmd(cmd, entry.cwd, style, flag)
+    return cmd
 
 
 def restore_session(
@@ -230,77 +344,73 @@ def restore_session(
         ws_map = snapshot_workspaces()
     except RuntimeError:
         ws_map = {}
-    before_app_counts: dict[str, int] = {}
-    for w in before_windows.values():
-        before_app_counts[w.get("app_id", "")] = before_app_counts.get(
-            w.get("app_id", ""), 0
-        ) + 1
-    saved_app_counts: dict[str, int] = {}
-    for entry in windows:
-        saved_app_counts[entry.app_id] = saved_app_counts.get(entry.app_id, 0) + 1
 
-    # Build spawn list: one spawn per missing window (dedup by cmd).
-    spawn_list: list[tuple[WindowEntry, str]] = []
-    seen_cmds: set[str] = set()
-    for entry in sorted(windows, key=lambda e: e.focus_order):
-        if entry.cmd in seen_cmds:
-            continue
-        seen_cmds.add(entry.cmd)
-        if before_app_counts.get(entry.app_id, 0) >= saved_app_counts.get(
-            entry.app_id, 0
-        ):
-            continue
-        spawn_list.append((entry, entry.cmd))
+    # The seat-global activation is `active`; `focused` is per-workspace
+    # memory and says nothing about which window holds the keyboard.
+    original_focus = next(
+        (wid for wid, w in before_windows.items() if w.get("active")), None
+    )
+    original_workspace = next(
+        (wid for wid, w in ws_map.items() if w.get("focused")), None
+    )
+
+    # Which saved entries already have a live window? The rest need one of
+    # their own, launched directly onto their workspace.
+    probe: list[tuple[WindowEntry, str]] = [(e, e.cmd) for e in windows]
+    pre_assigned = assign_entries(before_windows, probe, ws_map)
+    has_window = set(id(entry) for entry in pre_assigned.values())
+
+    # One launch per saved entry that has no window of its own. Each launch
+    # targets that entry's workspace, so the window is born in the right
+    # place instead of being moved there afterwards.
+    spawn_plan: list[tuple[WindowEntry, str]] = [
+        (entry, entry.cmd)
+        for entry in sorted(windows, key=lambda e: e.focus_order)
+        if id(entry) not in has_window
+    ]
 
     if not adjust_clients_only:
-        for entry, cmd in spawn_list:
-            style, flag = cfg.terminal_cwd_flags.get(
-                entry.app_id.lower(), ("separate", "--working-directory")
-            )
-            final_cmd = cmd
-            if cfg.restore_cwd and entry.cwd and entry.app_id.lower() in {
-                k.lower() for k in cfg.terminal_cwd_flags
-            }:
-                final_cmd = build_cwd_cmd(cmd, entry.cwd, style, flag)
-            binary = final_cmd.split()[0] if final_cmd.split() else ""
-            if not Path(binary).exists() and not _which(binary):
-                report.append((entry, "MISSING"))
-                continue
-            if not _send(f"spawn:{final_cmd}"):
-                report.append((entry, "MISSING"))
-            time.sleep(cfg.spawn_interval)
+        # Atomic placement: switch to the target workspace first, so the new
+        # window is born there. No focus and no move, which is what keeps the
+        # restore from stealing the focus.
+        by_workspace: dict[tuple[str, int], list[tuple[WindowEntry, str]]] = {}
+        for entry, cmd in spawn_plan:
+            key = (entry.workspace.output, entry.workspace.index)
+            by_workspace.setdefault(key, []).append((entry, cmd))
 
-    # Event-driven adjustment: watch for new windows.
+        for key in sorted(
+            by_workspace, key=lambda k: by_workspace[k][0][0].focus_order
+        ):
+            entry = by_workspace[key][0][0]
+            target = resolve_target_workspace(entry, ws_map)
+            if target is None:
+                for e, _c in by_workspace[key]:
+                    report.append((e, "MISSING"))
+                continue
+            _send(f"workspace-switch:{workspace_selector(target)}")
+            time.sleep(cfg.spawn_interval)
+            for e, cmd in by_workspace[key]:
+                final_cmd = _spawn_cmd(e, cfg)
+                binary = final_cmd.split()[0] if final_cmd.split() else ""
+                if not Path(binary).exists() and not _which(binary):
+                    report.append((e, "MISSING"))
+                    continue
+                if not _send(f"spawn:{final_cmd}"):
+                    report.append((e, "MISSING"))
+                time.sleep(cfg.spawn_interval)
+
     pending: list[tuple[WindowEntry, str]] = [
-        (entry, entry.cmd) for entry in windows
+        (entry, entry.cmd)
+        for entry in sorted(
+            windows, key=lambda e: (id(e) in has_window, e.focus_order)
+        )
     ]
-    matched: dict[str, WindowEntry] = {}  # wid -> entry (by identity)
-    spawned_app_ids = {entry.app_id for entry, _cmd in spawn_list}
-    # Save the currently focused window and active workspace so we can put
-    # both back after apply (apply calls window-focus which shifts them).
-    original_focus = None
-    original_workspace = None
-    for wid, w in before_windows.items():
-        if w.get("focused"):
-            original_focus = wid
-            break
-    for wid, w in ws_map.items():
-        if w.get("focused"):
-            original_workspace = wid
-            break
+    # wid -> (entry, spawned_here)
+    matched: dict[str, tuple[WindowEntry, bool]] = {}
+    spawn_entries = [entry for entry, _cmd in spawn_plan]
     deadline = time.monotonic() + cfg.load_time
 
-    if adjust_clients_only or not spawned_app_ids:
-        # Nothing to spawn: match the live windows against the saved entries.
-        current = snapshot_windows()
-        for entry, _cmd in list(pending):
-            wid = _pick_window(entry, current, matched, ws_map)
-            if wid is None:
-                continue
-            matched[wid] = entry
-            _remove_pending(pending, entry)
-            _apply_window(entry, wid, current[wid], cfg, ws_map)
-    else:
+    if spawn_entries and not adjust_clients_only:
         proc = subprocess.Popen(
             [UMBRIEL, "subscribe", "windows"],
             stdout=subprocess.PIPE,
@@ -315,9 +425,7 @@ def restore_session(
                     break
                 ready, _, _ = select.select([proc.stdout], [], [], min(remaining, 1.0))
                 if not ready:
-                    # All spawned apps matched?
-                    matched_app_ids = {e.app_id for e in matched.values()}
-                    if spawned_app_ids and spawned_app_ids <= matched_app_ids:
+                    if _all_matched(spawn_entries, matched):
                         break
                     continue
                 line = proc.stdout.readline()
@@ -332,79 +440,100 @@ def restore_session(
                     continue
                 if event.get("event") != "windows":
                     continue
-                data = event.get("data", [])
-                by_id = {w["id"]: w for w in data}
-                for wid in by_id:
-                    if wid in before_ids or wid in matched:
-                        continue
-                    hit = _match_window(wid, by_id, pending)
-                    if hit:
-                        entry, _cmd = hit
-                        matched[wid] = entry
-                        _remove_pending(pending, entry)
-                        _apply_window(entry, wid, by_id[wid], cfg, ws_map)
-                matched_app_ids = {e.app_id for e in matched.values()}
-                if spawned_app_ids and spawned_app_ids <= matched_app_ids:
+                by_id = {w["id"]: w for w in event.get("data", [])}
+                fresh = {
+                    wid: w
+                    for wid, w in by_id.items()
+                    if wid not in before_ids and wid not in matched
+                }
+                for wid, entry in assign_entries(fresh, pending, ws_map).items():
+                    matched[wid] = (entry, True)
+                    _remove_pending(pending, entry)
+                    _apply_window(
+                        entry,
+                        wid,
+                        by_id[wid],
+                        cfg,
+                        resolve_target_workspace(entry, ws_map),
+                    )
+                if _all_matched(spawn_entries, matched):
                     break
         finally:
             proc.terminate()
             proc.wait(timeout=5)
 
-    # Final pass: match remaining saved entries to existing windows (apps that
-    # were already running and didn't spawn a new window). Apply their saved
-    # state so already-running apps land on the right workspace.
+    # Match the entries that are still pending to windows that were already
+    # running: the app is up, its state just has to be applied.
     live_now = snapshot_windows()
-    for entry, _cmd in list(pending):
-        wid = _pick_window(entry, live_now, matched, ws_map)
-        if wid is None:
-            continue
-        matched[wid] = entry
+    remaining_live = {
+        wid: w for wid, w in live_now.items() if wid not in matched
+    }
+    pairs = list(assign_entries(remaining_live, pending, ws_map).items())
+    # Apply workspace by workspace. Focusing a window activates the workspace
+    # it sits on, so windows that share a workspace are handled together:
+    # the first focus activates it and the rest are free.
+    pairs.sort(
+        key=lambda pair: (
+            live_now[pair[0]].get("workspace", ""),
+            pair[1].focus_order,
+        )
+    )
+    for wid, entry in pairs:
+        matched[wid] = (entry, False)
         _remove_pending(pending, entry)
-        _apply_window(entry, wid, live_now[wid], cfg, ws_map)
+        _apply_window(
+            entry, wid, live_now[wid], cfg, resolve_target_workspace(entry, ws_map)
+        )
 
-    # Restore the workspace that was active before restore started.
-    if original_workspace:
+    # Put the active workspace and the focused window back where they were.
+    # Focusing a window that the restore moved elsewhere would switch the
+    # visible workspace, so it is skipped in that case.
+    after_workspaces = snapshot_workspaces()
+    active_workspace = next(
+        (wid for wid, w in after_workspaces.items() if w.get("focused")), None
+    )
+    if original_workspace and active_workspace != original_workspace:
         ws = ws_map.get(original_workspace)
         if ws:
-            if ws.get("named"):
-                _send(f'workspace-switch:"{ws["name"]}"')
-            else:
-                _send(f'workspace-switch:{ws["index"]}/{ws["output"]}')
+            _send(f"workspace-switch:{workspace_selector(ws)}")
 
-    # Focus replay. Only the most recently focused window on the active
-    # workspace is focused: focusing a window on another workspace would
-    # switch the visible workspace, and focusing many in a row makes the
-    # focus jump around.
-    if cfg.focus_last:
-        entry_to_wid = {id(e): wid for wid, e in matched.items()}
-        focus_order = sorted(
-            windows, key=lambda e: e.focus_order, reverse=True
-        )
-        live_after = snapshot_windows()
-        for entry in focus_order:
-            wid = entry_to_wid.get(id(entry))
-            if not wid:
-                continue
-            live = live_after.get(wid)
-            if not live:
-                continue
-            if original_workspace and live.get("workspace") != original_workspace:
-                continue
-            _send(f"window-focus:{wid}")
-            break
+    after_windows = snapshot_windows()
+    active_window = next(
+        (wid for wid, w in after_windows.items() if w.get("active")), None
+    )
+    if original_focus and active_window != original_focus:
+        target_ws = ws_map.get(original_workspace, {}).get("id")
+        if after_windows.get(original_focus, {}).get("workspace") == target_ws:
+            _send(f"window-focus:{original_focus}")
 
-    if original_focus:
-        _send(f"window-focus:{original_focus}")
-
-    # Report: OK only if this exact entry was matched to a window.
-    matched_ids = set(id(e) for e in matched.values())
+    matched_ids = set(id(e) for e, _spawned in matched.values())
     for entry in windows:
         if id(entry) in matched_ids:
-            report.append((entry, "OK"))
-        else:
+            spawned = any(
+                id(e) == id(entry) and s for e, s in matched.values()
+            )
+            report.append((entry, "RESTORED" if spawned else "EXISTING"))
+        elif not any(st == "MISSING" and id(e) == id(entry) for e, st in report):
             report.append((entry, "TIMEOUT"))
-    report.sort(key=lambda pair: pair[0].focus_order)
+
+    # Windows that run but are not in the session. The restore never closes
+    # anything, so they stay; the report says so.
+    for wid, window in after_windows.items():
+        if wid in matched:
+            continue
+        report.append((WindowEntry.from_live(window), "EXTRA"))
+
+    report.sort(key=lambda pair: (pair[1] == "EXTRA", pair[0].focus_order))
     return report
+
+
+def _all_matched(
+    spawn_entries: list[WindowEntry],
+    matched: dict[str, tuple[WindowEntry, bool]],
+) -> bool:
+    """True when every launched entry has a window of its own."""
+    matched_ids = set(id(e) for e, _s in matched.values())
+    return all(id(e) in matched_ids for e in spawn_entries)
 
 
 def _which(binary: str) -> bool:
