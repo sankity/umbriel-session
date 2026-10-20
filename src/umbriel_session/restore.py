@@ -85,6 +85,15 @@ def _match_window(
     return None
 
 
+def _remove_pending(
+    pending: list[tuple[WindowEntry, str]], entry: WindowEntry
+) -> None:
+    for i, (e, _) in enumerate(pending):
+        if e is entry:
+            del pending[i]
+            return
+
+
 def _apply_window(entry: WindowEntry, window_id: str, cfg: Config) -> None:
     # silent workspace move targets the focused window: focus first.
     _send(f"window-focus:{window_id}")
@@ -183,8 +192,19 @@ def restore_session(
     pending: list[tuple[WindowEntry, str]] = [
         (entry, entry.cmd) for entry in windows
     ]
-    matched: dict[str, str] = {}  # wid -> app_id
+    matched: dict[str, WindowEntry] = {}  # wid -> entry (by identity)
     spawned_app_ids = {entry.app_id for entry, _cmd in spawn_list}
+    # Save the currently focused window so we can restore focus after apply
+    # (apply calls window-focus which shifts the active workspace).
+    original_focus = None
+    try:
+        current_before = snapshot_windows()
+        for wid, w in current_before.items():
+            if w.get("focused"):
+                original_focus = wid
+                break
+    except Exception:
+        pass
     deadline = time.monotonic() + cfg.load_time
 
     if adjust_clients_only:
@@ -194,7 +214,8 @@ def restore_session(
             hit = _match_window(wid, current, pending)
             if hit:
                 entry, _cmd = hit
-                matched[wid] = entry.app_id
+                matched[wid] = entry
+                _remove_pending(pending, entry)
                 _apply_window(entry, wid, cfg)
     else:
         proc = subprocess.Popen(
@@ -211,7 +232,9 @@ def restore_session(
                     break
                 ready, _, _ = select.select([proc.stdout], [], [], min(remaining, 1.0))
                 if not ready:
-                    if spawned_app_ids <= set(matched.values()):
+                    # All spawned apps matched?
+                    matched_app_ids = {e.app_id for e in matched.values()}
+                    if spawned_app_ids and spawned_app_ids <= matched_app_ids:
                         break
                     continue
                 line = proc.stdout.readline()
@@ -234,30 +257,35 @@ def restore_session(
                     hit = _match_window(wid, by_id, pending)
                     if hit:
                         entry, _cmd = hit
-                        matched[wid] = entry.app_id
+                        matched[wid] = entry
+                        _remove_pending(pending, entry)
                         _apply_window(entry, wid, cfg)
-                if spawned_app_ids <= set(matched.values()):
+                matched_app_ids = {e.app_id for e in matched.values()}
+                if spawned_app_ids and spawned_app_ids <= matched_app_ids:
                     break
         finally:
             proc.terminate()
             proc.wait(timeout=5)
 
+    # Restore focus to the window that was focused before restore started.
+    if original_focus:
+        _send(f"window-focus:{original_focus}")
+
     # Focus replay: most-recently-focused window last.
     if cfg.focus_last:
+        entry_to_wid = {id(e): wid for wid, e in matched.items()}
         focus_order = sorted(
             windows, key=lambda e: e.focus_order, reverse=True
         )
         for entry in focus_order:
-            for wid, app_id in matched.items():
-                if app_id == entry.app_id:
-                    _send(f"window-focus:{wid}")
-                    break
+            wid = entry_to_wid.get(id(entry))
+            if wid:
+                _send(f"window-focus:{wid}")
 
-    # Report: OK when the app appeared (matched a new or existing window),
-    # TIMEOUT when neither the spawn nor the adjustment produced a window.
-    matched_app_ids = set(matched.values())
+    # Report: OK only if this exact entry was matched to a window.
+    matched_ids = set(id(e) for e in matched.values())
     for entry in windows:
-        if entry.app_id in matched_app_ids:
+        if id(entry) in matched_ids:
             report.append((entry, "OK"))
         else:
             report.append((entry, "TIMEOUT"))
