@@ -217,6 +217,16 @@ def restore_session(
                 matched[wid] = entry
                 _remove_pending(pending, entry)
                 _apply_window(entry, wid, cfg)
+    elif not spawned_app_ids:
+        # All apps already running: skip subscribe, match existing windows.
+        current = snapshot_windows()
+        for wid, window in current.items():
+            hit = _match_window(wid, current, pending)
+            if hit:
+                entry, _cmd = hit
+                matched[wid] = entry
+                _remove_pending(pending, entry)
+                _apply_window(entry, wid, cfg)
     else:
         proc = subprocess.Popen(
             [UMBRIEL, "subscribe", "windows"],
