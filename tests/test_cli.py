@@ -1,5 +1,6 @@
 """Tests for CLI commands (mocked compositor)."""
 
+import argparse
 import json
 import tempfile
 import unittest
@@ -54,6 +55,24 @@ class TestCliSave(unittest.TestCase):
         loaded = session.load_session()
         self.assertEqual(len(loaded.windows), 1)
         self.assertEqual(loaded.windows[0].app_id, "kitty")
+
+
+class TestCliRestore(unittest.TestCase):
+    def test_ctrl_c_exits_cleanly_with_status_130(self):
+        args = argparse.Namespace(
+            dry_run=False, profile=None, workspace=None, exclude=None,
+            adjust_clients_only=False,
+        )
+        with (
+            patch.object(cli, "load_config", return_value=config.Config()),
+            patch.object(cli, "_require_compositor"),
+            patch.object(cli, "restore_session", side_effect=KeyboardInterrupt),
+            patch.object(cli.console, "print") as output,
+            self.assertRaises(SystemExit) as exc,
+        ):
+            cli.cmd_restore(args)
+        self.assertEqual(exc.exception.code, 130)
+        output.assert_called_once_with("[yellow]Restore cancelled.[/yellow]")
 
 
 class TestCliStatus(unittest.TestCase):

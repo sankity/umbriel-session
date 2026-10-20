@@ -76,7 +76,7 @@ def _capture_now(cfg, profile: str | None) -> Session:
     entries = parse_compositor_windows(raw_windows, raw_workspaces)
     for entry in entries:
         entry.cmd = resolve_command(
-            entry.app_id, entry.pid, cfg.launch, desktop_map
+            entry.app_id, entry.pid, cfg.launch, desktop_map, title=entry.title
         ) or ""
         if entry.app_id.lower() in {k.lower() for k in cfg.terminal_cwd_flags}:
             entry.cwd = get_terminal_cwd(entry.pid)
@@ -105,20 +105,25 @@ def cmd_restore(args) -> None:
     if not args.dry_run:
         _require_compositor()
     try:
-        report = restore_session(
-            profile=args.profile,
-            dry_run=args.dry_run,
-            workspaces=args.workspace,
-            exclude=args.exclude,
-            adjust_clients_only=args.adjust_clients_only,
-            cfg=cfg,
-        )
+        with console.status("[cyan]Restoring session… (Ctrl+C to cancel)[/cyan]"):
+            report = restore_session(
+                profile=args.profile,
+                dry_run=args.dry_run,
+                workspaces=args.workspace,
+                exclude=args.exclude,
+                adjust_clients_only=args.adjust_clients_only,
+                cfg=cfg,
+            )
+    except KeyboardInterrupt:
+        console.print("[yellow]Restore cancelled.[/yellow]")
+        raise SystemExit(130) from None
     except RuntimeError as exc:
         console.print(f"[red]{exc}[/red]")
         raise SystemExit(1)
 
     table = Table(title=f"Restore: {args.profile or 'default'}")
     table.add_column("App")
+    table.add_column("Title", max_width=50)
     table.add_column("Workspace")
     table.add_column("Status")
     ok_status = ("OK", "DRY_RUN", "RESTORED", "EXISTING")
@@ -130,6 +135,7 @@ def cmd_restore(args) -> None:
             where = f"{entry.workspace.output}:{entry.workspace.index}"
         table.add_row(
             entry.app_id,
+            entry.title,
             where,
             f"[{colour}]{status}[/{colour}]",
         )

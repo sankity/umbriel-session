@@ -66,7 +66,7 @@ def capture(cfg) -> None:
     entries = parse_compositor_windows(raw_windows, raw_workspaces)
     for entry in entries:
         entry.cmd = resolve_command(
-            entry.app_id, entry.pid, cfg.launch, desktop_map
+            entry.app_id, entry.pid, cfg.launch, desktop_map, title=entry.title
         ) or ""
         if entry.app_id.lower() in {k.lower() for k in cfg.terminal_cwd_flags}:
             entry.cwd = get_terminal_cwd(entry.pid)

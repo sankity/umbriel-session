@@ -7,6 +7,8 @@ import os
 import re
 from pathlib import Path
 
+from .vscode import window_command
+
 log = logging.getLogger(__name__)
 
 _PLACEHOLDER_RE = re.compile(r"\s+%[a-zA-Z]")
@@ -161,6 +163,7 @@ def resolve_command(
     pid: int,
     launch_map: dict[str, str],
     desktop_map: dict[str, str],
+    title: str = "",
 ) -> str | None:
     """Resolve the launch command for a window.
 
@@ -175,6 +178,8 @@ def resolve_command(
 
     desktop_cmd = desktop_map.get(app_id.lower())
     if desktop_cmd:
+        if title:
+            return window_command(app_id, pid, title, desktop_cmd)
         return desktop_cmd
 
     candidates: list[str] = []
@@ -190,6 +195,6 @@ def resolve_command(
     for candidate in candidates:
         binary = candidate.split()[0] if candidate.split() else ""
         if _which(binary):
-            return candidate
+            return window_command(app_id, pid, title, candidate) if title else candidate
 
     return None
