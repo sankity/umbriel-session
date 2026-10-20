@@ -270,6 +270,10 @@ def cmd_config(_args) -> None:
         "\n"
         "[launch]\n"
         '# "zen" = "flatpak run org.zen_browser.zen"\n'
+        "\n"
+        "[electron]\n"
+        "# Extra app IDs: launch a default session once, not once per window.\n"
+        "apps = []\n"
     )
     console.print(f"[green]Created[/green] {CONFIG_FILE}")
 

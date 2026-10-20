@@ -7,7 +7,7 @@ import os
 import re
 from pathlib import Path
 
-from .vscode import window_command
+from .electron import window_command
 
 log = logging.getLogger(__name__)
 

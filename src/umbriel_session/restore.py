@@ -12,8 +12,10 @@ import subprocess
 import time
 from itertools import pairwise
 from pathlib import Path
+from typing import IO, Any
 
 from .config import Config
+from .electron import command_matches_title, requires_unique_title, session_launch_key
 from .models import Session, WindowEntry
 from .session import load_session
 from .terminal import build_cwd_cmd
@@ -27,6 +29,35 @@ UMBRIEL = "umbriel"
 POST_MATCH_SETTLE_SECONDS = 1.5
 POST_MATCH_MAX_SECONDS = 5.0
 FOCUS_RETRIES = 3
+
+
+def _read_window_snapshot(
+    stream: IO[Any], buffer: bytearray,
+) -> tuple[dict[str, dict] | None, bool]:
+    """Consume available bytes only; a partial JSON line must not block timers."""
+    fd = stream.fileno()
+    os.set_blocking(fd, False)
+    try:
+        chunk = os.read(fd, 65536)
+    except BlockingIOError:
+        return None, False
+    if not chunk:
+        return None, True
+    buffer.extend(chunk)
+    *lines, rest = bytes(buffer).split(b"\n")
+    buffer[:] = rest
+    latest = None
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+        if not isinstance(event, dict) or event.get("event") != "windows":
+            continue
+        data = event.get("data")
+        if isinstance(data, list) and all(isinstance(w, dict) and "id" in w for w in data):
+            latest = {w["id"]: w for w in data}
+    return latest, False
 
 
 def run_umbriel(*args: str, timeout: float = 10.0) -> subprocess.CompletedProcess:
@@ -389,17 +420,34 @@ def _native_browser_launch(entry: WindowEntry, command: str) -> tuple[str, str] 
     return (entry.app_id.lower(), shlex.join(args)) if args and not profile_value else None
 
 
+def _shared_session_launch(
+    entry: WindowEntry, command: str, electron_apps: set[str] | None = None,
+) -> tuple[str, str] | None:
+    return _native_browser_launch(entry, command) or session_launch_key(
+        entry.app_id, command, electron_apps,
+    )
+
+
+def _requires_unique_title(
+    entry: WindowEntry, command: str, electron_apps: set[str] | None = None,
+) -> bool:
+    return _native_browser_launch(entry, command) is not None or requires_unique_title(
+        entry.app_id, command, electron_apps,
+    )
+
+
 def assign_entries(
     live: dict[str, dict],
     pending: list[tuple[WindowEntry, str]],
     ws_map: dict[str, dict],
     strict_titles: bool = False,
     identity_live: dict[str, dict] | None = None,
+    electron_apps: set[str] | None = None,
 ) -> dict[str, WindowEntry]:
     """Assign live windows to saved entries.
 
     Try all exact app/title matches before workspace and app fallbacks. In
-    strict mode, native-restored browser windows require unique titles: their
+    strict mode, shared-session browser/Electron windows require unique titles: their
     launch workspace is not identity evidence. Editor commands carrying a
     workspace URI likewise wait until the title identifies that workspace.
     """
@@ -413,10 +461,8 @@ def assign_entries(
         if window.get("app_id", "") != entry.app_id:
             return False
         if strict_titles:
-            from .vscode import command_matches_title
-
             command = commands[id(entry)]
-            if _native_browser_launch(entry, command) is not None:
+            if _requires_unique_title(entry, command, electron_apps):
                 title = window.get("title", "")
                 # Launch workspaces are anchors, not evidence of browser-window
                 # identity. Native restoration can map windows in any order.
@@ -428,7 +474,7 @@ def assign_entries(
                     and sum(e.app_id == entry.app_id and e.title == title
                             for e, _ in pending) == 1
                 )
-            return command_matches_title(command, window.get("title", ""))
+            return command_matches_title(entry.app_id, command, window.get("title", ""))
         return True
 
     # A title that matches exactly one entry identifies the window.
@@ -906,11 +952,13 @@ def restore_session(
     # their own, launched directly onto their workspace.
     commands = {id(e): _spawn_cmd(e, cfg) for e in windows}
     probe: list[tuple[WindowEntry, str]] = [(e, commands[id(e)]) for e in windows]
-    pre_assigned = assign_entries(before_windows, probe, ws_map, strict_titles=True)
+    pre_assigned = assign_entries(
+        before_windows, probe, ws_map, strict_titles=True, electron_apps=cfg.electron_apps,
+    )
     has_window = set(id(entry) for entry in pre_assigned.values())
 
-    # Entries without a live match need restoration. Native browser entries
-    # share a launch operation below: one profile launch can restore them all.
+    # Entries without a live match need restoration. Browser/default Electron
+    # sessions share a launch operation; target-specific commands stay separate.
     spawn_plan: list[tuple[WindowEntry, str]] = [
         (entry, commands[id(entry)])
         for entry in sorted(windows, key=lambda e: e.focus_order)
@@ -993,10 +1041,10 @@ def restore_session(
             spawn_ws = temp_ws if is_original and temp_ws is not None else target
             for e, cmd in by_workspace[key]:
                 final_cmd = cmd
-                native_key = _native_browser_launch(e, final_cmd)
+                native_key = _shared_session_launch(e, final_cmd, cfg.electron_apps)
                 if native_key is not None:
                     if native_key in native_launches or e.app_id.lower() in running_apps:
-                        log.debug("reusing native browser restore for %s", e.app_id)
+                        log.debug("reusing shared application session for %s", e.app_id)
                         continue
                 try:
                     argv = shlex.split(final_cmd)
@@ -1051,14 +1099,19 @@ def restore_session(
         invalidated = False
         for wid, (entry, _spawned) in list(matched.items()):
             command = commands[id(entry)]
-            if _native_browser_launch(entry, command) is None:
-                continue
-            identities = [
-                candidate_id for candidate_id, window in live.items()
-                if window.get("app_id") == entry.app_id
-                and window.get("title") == entry.title
-            ]
-            if identities != [wid]:
+            if _requires_unique_title(entry, command, cfg.electron_apps):
+                identities = [
+                    candidate_id for candidate_id, window in live.items()
+                    if window.get("app_id") == entry.app_id
+                    and window.get("title") == entry.title
+                ]
+                valid = identities == [wid]
+            else:
+                current = live.get(wid)
+                valid = current is not None and command_matches_title(
+                    entry.app_id, command, current.get("title", ""),
+                )
+            if not valid:
                 del matched[wid]
                 pending.append((entry, command))
                 invalidated = True
@@ -1069,9 +1122,11 @@ def restore_session(
             [UMBRIEL, "subscribe", "windows"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
+            text=False,
+            bufsize=0,
         )
         assert proc.stdout is not None
+        event_buffer = bytearray()
         matched_at: float | None = None
         last_event_at = time.monotonic()
         try:
@@ -1095,21 +1150,15 @@ def restore_session(
                     [proc.stdout], [], [], min(remaining, 0.5)
                 )
                 if ready:
-                    line = proc.stdout.readline()
-                    if not line:
+                    by_id, eof = _read_window_snapshot(proc.stdout, event_buffer)
+                    if eof:
                         break
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if event.get("event") != "windows":
+                    if by_id is None:
                         continue
                     last_event_at = time.monotonic()
-                    by_id = {w["id"]: w for w in event.get("data", [])}
                 else:
-                    # readline() may already have buffered later event lines,
-                    # and title updates can outlive the initial map event. A
-                    # bounded snapshot fallback keeps matching from going stale.
+                    # Title updates can outlive initial map events. A bounded
+                    # snapshot fallback keeps matching from going stale.
                     try:
                         by_id = snapshot_windows()
                     except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
@@ -1131,7 +1180,8 @@ def restore_session(
                     if wid not in matched
                 }
                 for wid, entry in assign_entries(
-                    fresh, pending, ws_map, strict_titles=True, identity_live=by_id
+                    fresh, pending, ws_map, strict_titles=True, identity_live=by_id,
+                    electron_apps=cfg.electron_apps,
                 ).items():
                     matched[wid] = (entry, wid not in before_ids)
                     _remove_pending(pending, entry)
@@ -1170,7 +1220,8 @@ def restore_session(
     }
     refresh_workspaces()
     pairs = list(assign_entries(
-        remaining_live, pending, ws_map, strict_titles=True, identity_live=live_now
+        remaining_live, pending, ws_map, strict_titles=True, identity_live=live_now,
+        electron_apps=cfg.electron_apps,
     ).items())
     pairs.sort(
         key=lambda pair: (
@@ -1246,10 +1297,12 @@ def restore_session(
         elif not any(st == "MISSING" and id(e) == id(entry) for e, st in report):
             candidates = [w for wid, w in after_windows.items()
                           if wid not in matched and w.get("app_id") == entry.app_id]
-            ambiguous = bool(candidates) and _native_browser_launch(entry, commands[id(entry)]) is not None
+            ambiguous = bool(candidates) and _requires_unique_title(
+                entry, commands[id(entry)], cfg.electron_apps,
+            )
             if ambiguous:
                 log.warning(
-                    "cannot identify saved browser window %r among live titles %r; "
+                    "cannot identify saved shared-session window %r among live titles %r; "
                     "leaving it unmatched rather than guessing its workspace",
                     entry.title, sorted({w.get("title", "") for w in candidates}),
                 )

@@ -108,8 +108,34 @@ def test_uri_is_shell_quoted(code_root):
     assert shlex.split(cmd)[-1] == "file:///projects/a'b"
 
 
+@pytest.mark.parametrize("app_id,product", [
+    ("cursor", "Cursor"),
+    ("Cursor", "Cursor"),
+    ("cursor-url-handler", "Cursor"),
+    ("windsurf", "Windsurf"),
+    ("windsurf-url-handler", "Windsurf"),
+    ("antigravity-ide", "Antigravity IDE"),
+    ("antigravity-ide-url-handler", "Antigravity IDE"),
+])
+def test_verified_editor_products(code_root, app_id, product):
+    store(code_root, "a", {"folder": "file:///projects/one"})
+    assert vscode.is_editor(app_id)
+    with patch.object(vscode, "_user_data_dir", return_value=code_root) as data_dir:
+        command = vscode.window_command(app_id, 42, f"one - {product}", app_id)
+    data_dir.assert_called_once_with(product, 42)
+    assert shlex.split(command) == [app_id, "--new-window", "--folder-uri", "file:///projects/one"]
+
+
+def test_fork_config_root_honors_xdg(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    for product in ("Cursor", "Windsurf", "Antigravity IDE"):
+        assert vscode._user_data_dir(product, -1) == tmp_path / product
+
+
 def test_other_apps_unchanged():
-    assert vscode.window_command("kitty", 42, "term", "kitty") == "kitty"
+    for app_id in ("kitty", "antigravity", "org.example.cursor-helper", "random-code-editor"):
+        assert not vscode.is_editor(app_id)
+        assert vscode.window_command(app_id, 42, "term", app_id) == app_id
 
 
 def test_transient_and_wrong_titles_rejected():

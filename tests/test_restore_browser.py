@@ -93,7 +93,15 @@ def desktop(monkeypatch):
                 state["windows"][focused]["workspace"] = f"eDP-1:{index}"
         return True
 
+    def read_snapshot(stream, buffer):
+        line = stream.readline()
+        if not line:
+            return None, True
+        event = json.loads(line)
+        return {w["id"]: w for w in event["data"]}, False
+
     proc.stdout.readline.side_effect = readline
+    monkeypatch.setattr(restore, "_read_window_snapshot", read_snapshot)
     monkeypatch.setattr(restore, "load_session", lambda profile: saved)
     monkeypatch.setattr(restore, "snapshot_windows", lambda: copy.deepcopy(state["windows"]))
     monkeypatch.setattr(restore, "snapshot_workspaces", lambda: copy.deepcopy(ws))

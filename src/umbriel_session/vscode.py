@@ -1,4 +1,14 @@
-"""Recover per-window VS Code launch targets without using its shared PID argv."""
+"""Recover per-window targets for explicitly recognized VS Code-derived editors.
+
+Cursor/Windsurf retain VS Code's User/workspaceStorage layout. References:
+https://forum.cursor.com/t/sync-of-keybindings-and-settings/31/115
+https://syv-labs.gitbook.io/context-pool/ide-setup/other-ides
+
+The installed /usr/share/applications/antigravity-ide.desktop and
+/opt/antigravity-ide/resources/app/product.json identify applicationName
+'antigravity-ide', nameShort 'Antigravity IDE' (VS Code 1.107.0 package).
+The separate 'Antigravity' app is NOT that editor and is intentionally excluded.
+"""
 
 from __future__ import annotations
 
@@ -21,7 +31,18 @@ _PRODUCTS = {
     "vscodium": "VSCodium",
     "codium": "VSCodium",
     "com.vscodium.codium": "VSCodium",
+    "cursor": "Cursor",
+    "cursor-url-handler": "Cursor",
+    "windsurf": "Windsurf",
+    "windsurf-url-handler": "Windsurf",
+    "antigravity-ide": "Antigravity IDE",
+    "antigravity-ide-url-handler": "Antigravity IDE",
 }
+
+
+def is_editor(app_id: str) -> bool:
+    """Whether this exact app ID has a supported editor metadata adapter."""
+    return app_id.lower() in _PRODUCTS
 
 
 def _read_json(path: Path) -> dict:

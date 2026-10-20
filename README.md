@@ -7,7 +7,8 @@ Session save and restore for the [Umbriel](https://github.com/noctalia-dev/umbri
 - Snapshots windows, workspaces, geometry, and state to JSON
 - Restore by spawning apps and silently moving them to saved workspaces, keeping the previously focused window focused
 - Restore horizontal scrolling-column order from saved positions and floating-window geometry
-- Recover individual VS Code / Code Insiders / VSCodium folders and workspaces
+- Recover supported VS Code-family editor workspaces and Obsidian vaults
+- Shared-session launch handling for supported Electron clients, with custom app-ID opt-in
 - Event-driven auto-save daemon
 - Bridge commands for Flatpak / Snap / Electron apps
 - Named profiles, dry-run, diff, and adjust-only reconcile mode
@@ -94,14 +95,29 @@ content_types = ["video", "game"]
 # Optional override when automatic per-window target detection is ambiguous.
 # Use --new-window so separate saved editor windows cannot reuse each other.
 "umbriel-session - Visual Studio Code" = "code --new-window /home/you/path/to/umbriel-session"
+
+[electron]
+# Additional app IDs, beyond the built-in clients below.
+apps = []
 ```
 
 ### Restoring individual windows of an Electron app
 
-Electron windows can share a compositor-reported PID, so `/proc/<pid>/cmdline`
-does not identify the folder belonging to each window.
+Electron applications can create several windows under one main process and
+may forward subsequent launches to that instance. This behavior is app-defined:
+Electron does not provide a universal per-window restore command, metadata
+format, or `--new-window` flag. The main PID's command line alone does not
+identify every open document or workspace.
 
-For VS Code, Code Insiders, and VSCodium, save reads local workspace metadata
+Support is deliberately app-specific:
+
+| Applications | Recovery capability |
+| --- | --- |
+| VS Code, Code Insiders, VSCodium, Cursor, Windsurf, Antigravity IDE (`antigravity-ide`) | Per-window folder / `.code-workspace` URI |
+| Obsidian | Per-vault `obsidian://open?vault=<id>` URI |
+| Discord, Slack, Signal, Joplin, Bitwarden | One identical default launch per application session, then title-based placement |
+
+For supported VS Code-family editors, save reads local workspace metadata
 and matches it to each window title. Open workspace databases in the app's
 process tree are preferred over historical metadata. The saved command includes
 `--new-window` and the folder or `.code-workspace` URI, including remote URIs.
@@ -116,8 +132,44 @@ remain explicit commands and bypass this detection. Other Electron applications
 may also need `[launch_by_title]` to reopen a specific window rather than their
 default window.
 
-**Save again with your intended editor folders open after upgrading.** Existing
-session files containing only `"cmd": "code"` do not contain those folder paths.
+Obsidian reads only vault IDs and paths from local `obsidian.json`. A unique
+vault in the window title becomes an encoded, shell-quoted URI. Native and
+supported Flatpak launchers use their respective profile metadata. Restore waits
+for the correct vault title, so changing the note within that vault is allowed;
+an unloaded `Obsidian` window cannot claim the wrong vault. Duplicate vault
+names are not guessed. This reopens the vault, not a historical copy of its tabs,
+notes, or pop-out windows.
+
+For the generic clients above, a default launch is shared across saved windows.
+If that app already has a live window, another default launch is not issued.
+Explicit target commands remain independent. A unique app/title match is
+required before placing each window, even for explicit client URI launches. The
+app itself must reopen any additional windows; this policy does not fabricate
+extra chat windows or restore channels, messages, account sessions, or unsaved
+application data. Generic/duplicate titles produce `AMBIGUOUS` rather than a
+workspace-based guess. Existing native-session duplicates are never closed.
+
+Native and known Flatpak app IDs are recognized for the generic clients and
+Obsidian. Other Electron clients can opt
+in to this shared-session policy using the exact compositor `app_id`:
+
+```toml
+[electron]
+apps = ["custom.chat"]
+```
+
+This opt-in is a launch/matching policy, not automatic document recovery or
+runtime detection of every Electron app. Unknown app IDs retain the existing
+per-window launch behavior. Unsupported launch options or wrappers are left
+alone rather than assigned guessed semantics. Supported editor adapters are not
+converted to shared-session launches by this option. For another app's specific
+document/window, provide its supported CLI or URI via `[launch_by_title]`; do not
+add `--new-window` unless that particular app documents it.
+
+**Save a new snapshot with the intended editor folders/vaults open to record
+newly supported targets.** Older snapshots containing only `code`, `cursor`, or
+`obsidian` do not contain the missing target URIs. Neither save nor restore
+changes the application profiles.
 
 ### Zen / Firefox native session restoration
 

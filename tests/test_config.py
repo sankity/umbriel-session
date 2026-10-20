@@ -58,6 +58,18 @@ class TestConfig(unittest.TestCase):
         cfg = config.load_config()
         self.assertEqual(cfg.launch["zen"], "flatpak run org.zen_browser.zen")
 
+    def test_parse_additional_electron_apps(self):
+        config.CONFIG_FILE.write_text('[electron]\napps = ["Custom.Chat", " widget ", ""]\n')
+        cfg = config.load_config()
+        self.assertEqual(cfg.electron_apps, {"custom.chat", "widget"})
+
+    def test_invalid_electron_apps_do_not_become_character_ids(self):
+        config.CONFIG_FILE.write_text('[electron]\napps = "discord"\n')
+        self.assertEqual(config.load_config().electron_apps, set())
+
+    def test_defaults_have_no_custom_electron_apps(self):
+        self.assertEqual(config.load_config().electron_apps, set())
+
     def test_invalid_toml_falls_back(self):
         config.CONFIG_FILE.write_text("this is not [valid toml\n")
         cfg = config.load_config()

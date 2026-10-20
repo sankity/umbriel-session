@@ -51,8 +51,10 @@ class Config:
     )
     launch: dict[str, str] = field(default_factory=dict)
     # Window title -> launch command, for apps whose windows cannot be told
-    # apart by app id or pid (Electron apps share one process).
+    # apart by app id or pid (Electron windows can share a main process).
     launch_by_title: dict[str, str] = field(default_factory=dict)
+    # Additional app IDs whose default command owns a shared Electron session.
+    electron_apps: set[str] = field(default_factory=set)
     terminal_cwd_flags: dict[str, tuple[str, str]] = field(
         default_factory=lambda: dict(DEFAULT_TERMINAL_CWD_FLAGS)
     )
@@ -103,6 +105,10 @@ def load_config() -> Config:
 
     cfg.launch = {k.lower(): v for k, v in data.get("launch", {}).items()}
     cfg.launch_by_title = dict(data.get("launch_by_title", {}))
+    electron = data.get("electron", {})
+    apps = electron.get("apps", []) if isinstance(electron, dict) else []
+    if isinstance(apps, list) and all(isinstance(app, str) for app in apps):
+        cfg.electron_apps = {app.strip().lower() for app in apps if app.strip()}
 
     if "terminal_cwd_flags" in data:
         cfg.terminal_cwd_flags = _parse_terminal_flags(data["terminal_cwd_flags"])

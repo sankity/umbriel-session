@@ -310,9 +310,7 @@ class TestRestorePlacement(unittest.TestCase):
         }
         areas = {"eDP-1": {"x": 0, "y": 40, "width": 1920, "height": 1080}}
         subscriber = mock.Mock()
-        subscriber.stdout.readline.side_effect = [
-            json.dumps({"event": "windows", "data": [original, spawned]}), "",
-        ]
+
         with (
             mock.patch("umbriel_session.restore.load_session", return_value=session),
             mock.patch("umbriel_session.restore.snapshot_windows", side_effect=[
@@ -324,6 +322,9 @@ class TestRestorePlacement(unittest.TestCase):
             mock.patch("umbriel_session.restore._send_many", return_value=True) as send,
             mock.patch("umbriel_session.restore._which", return_value=True),
             mock.patch("umbriel_session.restore.subprocess.Popen", return_value=subscriber),
+            mock.patch("umbriel_session.restore._read_window_snapshot", side_effect=[
+                ({"f": original, "w1": spawned}, False), (None, True),
+            ]),
             mock.patch("umbriel_session.restore.select.select", return_value=([subscriber.stdout], [], [])),
         ):
             report = restore_session(cfg=Config(restore_delay_seconds=0, spawn_interval=0))
