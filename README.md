@@ -5,7 +5,7 @@ Session save and restore for the [Umbriel](https://github.com/noctalia-dev/umbri
 ## Features
 
 - Snapshots windows, workspaces, geometry, and state to JSON
-- Restore by spawning apps and silently moving them to saved workspaces
+- Restore by spawning apps and silently moving them to saved workspaces, keeping the previously focused window focused
 - Event-driven auto-save daemon
 - Bridge commands for Flatpak / Snap / Electron apps
 - Named profiles, dry-run, diff, and adjust-only reconcile mode

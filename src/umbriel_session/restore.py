@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import select
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -17,6 +19,12 @@ from .terminal import build_cwd_cmd
 log = logging.getLogger(__name__)
 
 UMBRIEL = "umbriel"
+
+# Once every launched entry has a window, keep listening for a moment so a
+# late-mapping second window cannot steal focus after the restore returns.
+POST_MATCH_SETTLE_SECONDS = 1.5
+POST_MATCH_MAX_SECONDS = 5.0
+FOCUS_RETRIES = 3
 
 
 def run_umbriel(*args: str, timeout: float = 10.0) -> subprocess.CompletedProcess:
@@ -61,6 +69,13 @@ def snapshot_workspaces() -> dict[str, dict]:
     return {w["id"]: w for w in data}
 
 
+def _active_window(windows: dict[str, dict]) -> str | None:
+    """Return the id of the seat-focused window, if any."""
+    return next(
+        (wid for wid, window in windows.items() if window.get("active")), None
+    )
+
+
 def _ws_key(ws_id: str, ws_map: dict[str, dict]) -> tuple[str, int] | None:
     """Map a live workspace id to the (output, index) pair a saved entry uses."""
     ws = ws_map.get(ws_id)
@@ -82,16 +97,87 @@ def workspace_selector(live_ws: dict) -> str:
     return f"{live_ws.get('index', 1)}/{output}" if output else str(live_ws.get("index", 1))
 
 
+def _temp_workspace(
+    ws_map: dict[str, dict],
+    original_workspace: str | None,
+    reserved: set[tuple[str, int]] | None = None,
+) -> dict | None:
+    """Return an empty workspace to anchor launches for the original one.
+
+    A launch token keeps the window on the workspace that was active when the
+    token was issued. Spawning an entry for the original workspace directly
+    would make its window map on the workspace that already has focus, which
+    steals the focus. Anchoring it to an empty workspace lets it map silently;
+    the window is moved back once it exists.
+
+    Reusing an empty unnamed workspace avoids leaving a new empty workspace
+    behind after every restore.
+    """
+    original = ws_map.get(original_workspace or "")
+    if original is None:
+        return None
+    output = original.get("output", "")
+    same_output = [w for w in ws_map.values() if w.get("output") == output]
+    if not same_output:
+        return None
+
+    reserved = reserved or set()
+    empty = [
+        workspace
+        for workspace in same_output
+        if workspace.get("id") != original_workspace
+        and not workspace.get("named")
+        and not workspace.get("occupied", False)
+        and int(workspace.get("window_count", 0)) == 0
+        and (workspace.get("output"), workspace.get("index")) not in reserved
+    ]
+    if empty:
+        return max(empty, key=lambda workspace: int(workspace.get("index", 0)))
+
+    index = max(int(w.get("index", 0)) for w in same_output) + 1
+    return {"output": output, "index": index, "named": False, "name": str(index)}
+
+
+def _focus_restore_actions(focus_id: str | None) -> list[str]:
+    return [f"window-focus:{focus_id}"] if focus_id else []
+
+
+def _spawn_batch_actions(
+    cmd: str,
+    spawn_ws: dict,
+    return_ws: dict | None,
+    focus_id: str | None,
+) -> list[str]:
+    """Actions that launch one app and return to the original workspace.
+
+    All actions go through one batch, so the compositor applies the temporary
+    workspace switch and its reversal before drawing a frame.
+    """
+    actions = [
+        f"workspace-switch:{workspace_selector(spawn_ws)}",
+        f"spawn:{cmd}",
+    ]
+    if return_ws is not None:
+        actions.append(f"workspace-switch:{workspace_selector(return_ws)}")
+    actions.extend(_focus_restore_actions(focus_id))
+    return actions
+
+
 def resolve_target_workspace(
-    entry: WindowEntry, ws_map: dict[str, dict]
+    entry: WindowEntry, ws_map: dict[str, dict], avoid: str | None = None
 ) -> dict | None:
     """Find the live workspace a saved entry belongs to.
 
     A saved index can point past the end of the live inventory when Umbriel
     pruned an empty dynamic workspace, so the last workspace on that output
-    is the fallback.
+    is the fallback. `avoid` skips the temporary launch workspace, which is
+    empty and must not become that fallback.
     """
-    on_output = [w for w in ws_map.values() if w.get("output") == entry.workspace.output]
+    on_output = [
+        w
+        for w in ws_map.values()
+        if w.get("output") == entry.workspace.output and w.get("id") != avoid
+    ]
     if not on_output:
         return None
     for w in on_output:
@@ -117,6 +203,104 @@ def _send(action: str) -> bool:
         log.warning("msg %s failed: %s", action, result.stderr.strip())
         return False
     return True
+
+
+def _ipc_path() -> str | None:
+    path = os.environ.get("UMBRIEL_SOCKET")
+    if path:
+        return path
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    display = os.environ.get("WAYLAND_DISPLAY")
+    if runtime_dir and display:
+        return f"{runtime_dir}/umbriel-{display}.sock"
+    return None
+
+
+def _send_sequentially(actions: list[str]) -> bool:
+    ok = True
+    for action in actions:
+        ok = _send(action) and ok
+    return ok
+
+
+def _read_line(conn: socket.socket, buf: bytearray) -> bytes:
+    while b"\n" not in buf:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        buf.extend(chunk)
+    line, _, rest = bytes(buf).partition(b"\n")
+    buf[:] = rest
+    return line
+
+
+def _send_many(actions: list[str]) -> bool:
+    """Apply several actions in one compositor event-loop turn.
+
+    A plain IPC connection is closed after its first reply, so parallel
+    connections only batch by luck. A subscribed connection stays open and the
+    server drains every buffered request before returning to its event loop,
+    which makes the whole sequence atomic: no intermediate focus or workspace
+    is ever drawn.
+    """
+    if not actions:
+        return True
+    if len(actions) == 1:
+        return _send(actions[0])
+
+    log.debug("batch: %s", actions)
+    path = _ipc_path()
+    if path is None:
+        return _send_sequentially(actions)
+
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.settimeout(5.0)
+    try:
+        conn.connect(path)
+    except OSError as exc:
+        conn.close()
+        log.warning("batch IPC unavailable (%s); sending sequentially", exc)
+        return _send_sequentially(actions)
+
+    buf = bytearray()
+    try:
+        subscribe = json.dumps({"cmd": "subscribe", "events": ["submap"]})
+        conn.sendall(subscribe.encode() + b"\n")
+        initial = _read_line(conn, buf)
+        if not initial or b'"err"' in initial:
+            raise OSError("batch subscription rejected")
+
+        requests = b"".join(
+            json.dumps({"cmd": "msg", "arg": action}).encode() + b"\n"
+            for action in actions
+        )
+        conn.sendall(requests)
+
+        ok = True
+        responses = 0
+        while responses < len(actions):
+            line = _read_line(conn, buf)
+            if not line:
+                ok = False
+                break
+            if b'"event":' in line:
+                continue
+            responses += 1
+            if b'"err"' in line:
+                log.warning(
+                    "msg %s failed: %s",
+                    actions[responses - 1],
+                    line.decode(errors="replace").strip(),
+                )
+                ok = False
+        return ok
+    except OSError as exc:
+        # The requests may already have run; never resend them, spawns would
+        # be duplicated. The caller reports a failed batch.
+        log.warning("batch IPC failed: %s", exc)
+        return False
+    finally:
+        conn.close()
 
 
 def _remove_pending(
@@ -243,57 +427,58 @@ def assign_entries(
     return assignment
 
 
-def _apply_window(
+def _window_actions(
     entry: WindowEntry,
     window_id: str,
     current: dict,
     cfg: Config,
     target_ws: dict | None,
-) -> None:
-    """Apply the saved state to a live window.
+) -> list[str]:
+    """Return the actions needed to apply the saved state to a live window.
 
-    Focus switches the visible workspace, so it is only used when the state
-    actually needs it: moving the window to its workspace, or a focused-window
-    action (fullscreen/maximize/pin).
+    Focused-window actions (fullscreen/maximize/pin) and silent moves need the
+    target window focused first. They are applied before the move and the
+    caller restores the original focus in the same batch.
     """
+    actions: list[str] = []
     on_target = False
+    on_output = False
     if target_ws is not None:
         on_target = current.get("workspace") == target_ws.get("id")
         on_output = current.get("output") == target_ws.get("output")
 
-        needs_focus = (
-            not (on_target and on_output)
-            or (cfg.restore_fullscreen and entry.fullscreen and not current.get("fullscreen"))
-            or (entry.maximized and not current.get("maximized"))
-            or (entry.pinned and not current.get("pinned"))
-        )
-        if needs_focus:
-            _send(f"window-focus:{window_id}")
+    move_needed = target_ws is not None and not (on_target and on_output)
+    fullscreen_needed = (
+        cfg.restore_fullscreen
+        and entry.fullscreen
+        and not current.get("fullscreen")
+    )
+    maximize_needed = entry.maximized and not current.get("maximized")
+    pin_needed = entry.pinned and not current.get("pinned")
 
-        if not (on_target and on_output):
-            _send(
-                f"window-move-to-workspace-silent:{workspace_selector(target_ws)}"
-            )
-    else:
-        needs_focus = (
-            (cfg.restore_fullscreen and entry.fullscreen and not current.get("fullscreen"))
-            or (entry.maximized and not current.get("maximized"))
-            or (entry.pinned and not current.get("pinned"))
-        )
-        if needs_focus:
-            _send(f"window-focus:{window_id}")
+    if move_needed or fullscreen_needed or maximize_needed or pin_needed:
+        actions.append(f"window-focus:{window_id}")
 
     if cfg.restore_floating and entry.floating != current.get("floating", False):
-        _send(f"window-toggle-floating:{window_id}")
-        _send(f"window-move-to:center/0/0/{window_id}")
+        actions.append(f"window-toggle-floating:{window_id}")
+        if entry.floating:
+            actions.append(f"window-move-to:center/0/0/{window_id}")
 
     # maximize/fullscreen/pinned are focused-window actions.
-    if cfg.restore_fullscreen and entry.fullscreen and not current.get("fullscreen"):
-        _send("window-toggle-fullscreen")
-    if entry.maximized and not current.get("maximized"):
-        _send("window-toggle-maximize")
-    if entry.pinned and not current.get("pinned"):
-        _send("window-toggle-pinned")
+    if fullscreen_needed:
+        actions.append("window-toggle-fullscreen")
+    if maximize_needed:
+        actions.append("window-toggle-maximize")
+    if pin_needed:
+        actions.append("window-toggle-pinned")
+
+    # The silent move targets the most recently focused window, so it must
+    # come after the focus action above.
+    if move_needed and target_ws is not None:
+        actions.append(
+            f"window-move-to-workspace-silent:{workspace_selector(target_ws)}"
+        )
+    return actions
 
 
 def _spawn_cmd(entry: WindowEntry, cfg: Config) -> str:
@@ -304,6 +489,47 @@ def _spawn_cmd(entry: WindowEntry, cfg: Config) -> str:
         style, flag = flags
         cmd = build_cwd_cmd(cmd, entry.cwd, style, flag)
     return cmd
+
+
+def _clear_temp_workspace(
+    temp_ws: dict | None,
+    original_ws: dict | None,
+    focus_id: str | None,
+) -> None:
+    """Move anything left on the temporary launch workspace to the original.
+
+    A matched window is moved by `_window_actions`; this catches extra windows
+    from the same app and keeps the temporary workspace from surviving with
+    windows on it.
+    """
+    if temp_ws is None or original_ws is None:
+        return
+    try:
+        live_ws = snapshot_workspaces()
+        live = snapshot_windows()
+    except RuntimeError:
+        return
+    temp_id = next(
+        (
+            wid
+            for wid, workspace in live_ws.items()
+            if workspace.get("output") == temp_ws.get("output")
+            and workspace.get("index") == temp_ws.get("index")
+            and not workspace.get("named")
+        ),
+        None,
+    )
+    if temp_id is None:
+        return
+    for wid, window in live.items():
+        if window.get("workspace") != temp_id:
+            continue
+        actions = [
+            f"window-focus:{wid}",
+            f"window-move-to-workspace-silent:{workspace_selector(original_ws)}",
+            f"workspace-switch:{workspace_selector(original_ws)}",
+        ]
+        _send_many(actions + _focus_restore_actions(focus_id))
 
 
 def restore_session(
@@ -347,12 +573,14 @@ def restore_session(
 
     # The seat-global activation is `active`; `focused` is per-workspace
     # memory and says nothing about which window holds the keyboard.
-    original_focus = next(
-        (wid for wid, w in before_windows.items() if w.get("active")), None
+    focus_id = _active_window(before_windows)
+    original_workspace = (
+        before_windows.get(focus_id, {}).get("workspace") if focus_id else None
     )
-    original_workspace = next(
-        (wid for wid, w in ws_map.items() if w.get("focused")), None
-    )
+    if not original_workspace:
+        original_workspace = next(
+            (wid for wid, w in ws_map.items() if w.get("focused")), None
+        )
 
     # Which saved entries already have a live window? The rest need one of
     # their own, launched directly onto their workspace.
@@ -361,18 +589,33 @@ def restore_session(
     has_window = set(id(entry) for entry in pre_assigned.values())
 
     # One launch per saved entry that has no window of its own. Each launch
-    # targets that entry's workspace, so the window is born in the right
-    # place instead of being moved there afterwards.
+    # carries its saved workspace, so the window maps there without the
+    # restore first having to visit that workspace.
     spawn_plan: list[tuple[WindowEntry, str]] = [
         (entry, entry.cmd)
         for entry in sorted(windows, key=lambda e: e.focus_order)
         if id(entry) not in has_window
     ]
 
+    temp_ws: dict | None = None
+    return_ws: dict | None = None
+    avoid_ws: str | None = None
+    temp_used = False
     if not adjust_clients_only:
-        # Atomic placement: switch to the target workspace first, so the new
-        # window is born there. No focus and no move, which is what keeps the
-        # restore from stealing the focus.
+        # Launch each missing window on its saved workspace, but return to the
+        # original workspace before the app maps. The launch token keeps the
+        # window on the target workspace; because the original workspace is
+        # active when it maps, the compositor treats it as a silent launch.
+        # Entries for the original workspace itself need a temporary anchor,
+        # otherwise their windows would map on the active workspace and take
+        # the focus.
+        reserved = {
+            (entry.workspace.output, entry.workspace.index) for entry in windows
+        }
+        temp_ws = _temp_workspace(ws_map, original_workspace, reserved)
+        avoid_ws = temp_ws.get("id") if temp_ws else None
+        return_ws = ws_map.get(original_workspace or "")
+
         by_workspace: dict[tuple[str, int], list[tuple[WindowEntry, str]]] = {}
         for entry, cmd in spawn_plan:
             key = (entry.workspace.output, entry.workspace.index)
@@ -382,20 +625,34 @@ def restore_session(
             by_workspace, key=lambda k: by_workspace[k][0][0].focus_order
         ):
             entry = by_workspace[key][0][0]
-            target = resolve_target_workspace(entry, ws_map)
+            target = resolve_target_workspace(entry, ws_map, avoid_ws)
             if target is None:
                 for e, _c in by_workspace[key]:
                     report.append((e, "MISSING"))
                 continue
-            _send(f"workspace-switch:{workspace_selector(target)}")
-            time.sleep(cfg.spawn_interval)
+            is_original = (
+                original_workspace is not None
+                and target.get("id") == original_workspace
+            )
+            if is_original and temp_ws is None:
+                log.warning(
+                    "no temporary workspace for %s; a new window on the "
+                    "original workspace may take focus",
+                    target.get("id", "unknown"),
+                )
+            spawn_ws = temp_ws if is_original and temp_ws is not None else target
             for e, cmd in by_workspace[key]:
                 final_cmd = _spawn_cmd(e, cfg)
                 binary = final_cmd.split()[0] if final_cmd.split() else ""
                 if not Path(binary).exists() and not _which(binary):
                     report.append((e, "MISSING"))
                     continue
-                if not _send(f"spawn:{final_cmd}"):
+                actions = _spawn_batch_actions(
+                    final_cmd, spawn_ws, return_ws or target, focus_id
+                )
+                if spawn_ws is temp_ws:
+                    temp_used = True
+                if not _send_many(actions):
                     report.append((e, "MISSING"))
                 time.sleep(cfg.spawn_interval)
 
@@ -418,15 +675,23 @@ def restore_session(
             text=True,
         )
         assert proc.stdout is not None
+        matched_at: float | None = None
+        last_event_at = time.monotonic()
         try:
             while True:
-                remaining = deadline - time.monotonic()
+                now = time.monotonic()
+                remaining = deadline - now
                 if remaining <= 0:
                     break
-                ready, _, _ = select.select([proc.stdout], [], [], min(remaining, 1.0))
+                if matched_at is not None and (
+                    now - last_event_at >= POST_MATCH_SETTLE_SECONDS
+                    or now - matched_at >= POST_MATCH_MAX_SECONDS
+                ):
+                    break
+                ready, _, _ = select.select(
+                    [proc.stdout], [], [], min(remaining, 0.5)
+                )
                 if not ready:
-                    if _all_matched(spawn_entries, matched):
-                        break
                     continue
                 line = proc.stdout.readline()
                 if not line:
@@ -440,7 +705,12 @@ def restore_session(
                     continue
                 if event.get("event") != "windows":
                     continue
+
+                last_event_at = time.monotonic()
                 by_id = {w["id"]: w for w in event.get("data", [])}
+                if focus_id is not None and focus_id not in by_id:
+                    focus_id = None
+
                 fresh = {
                     wid: w
                     for wid, w in by_id.items()
@@ -449,15 +719,25 @@ def restore_session(
                 for wid, entry in assign_entries(fresh, pending, ws_map).items():
                     matched[wid] = (entry, True)
                     _remove_pending(pending, entry)
-                    _apply_window(
+                    actions = _window_actions(
                         entry,
                         wid,
                         by_id[wid],
                         cfg,
-                        resolve_target_workspace(entry, ws_map),
+                        resolve_target_workspace(entry, ws_map, avoid_ws),
                     )
+                    if actions:
+                        _send_many(actions + _focus_restore_actions(focus_id))
+
+                # A window that mapped late (or a second window the launch
+                # token did not cover) must not keep the focus.
+                active = _active_window(by_id)
+                if focus_id and active and active != focus_id:
+                    _send_many(_focus_restore_actions(focus_id))
+
                 if _all_matched(spawn_entries, matched):
-                    break
+                    if matched_at is None:
+                        matched_at = time.monotonic()
         finally:
             proc.terminate()
             proc.wait(timeout=5)
@@ -465,13 +745,12 @@ def restore_session(
     # Match the entries that are still pending to windows that were already
     # running: the app is up, its state just has to be applied.
     live_now = snapshot_windows()
+    if focus_id is not None and focus_id not in live_now:
+        focus_id = None
     remaining_live = {
         wid: w for wid, w in live_now.items() if wid not in matched
     }
     pairs = list(assign_entries(remaining_live, pending, ws_map).items())
-    # Apply workspace by workspace. Focusing a window activates the workspace
-    # it sits on, so windows that share a workspace are handled together:
-    # the first focus activates it and the rest are free.
     pairs.sort(
         key=lambda pair: (
             live_now[pair[0]].get("workspace", ""),
@@ -481,30 +760,35 @@ def restore_session(
     for wid, entry in pairs:
         matched[wid] = (entry, False)
         _remove_pending(pending, entry)
-        _apply_window(
-            entry, wid, live_now[wid], cfg, resolve_target_workspace(entry, ws_map)
+        actions = _window_actions(
+            entry,
+            wid,
+            live_now[wid],
+            cfg,
+            resolve_target_workspace(entry, ws_map, avoid_ws),
         )
+        if actions:
+            _send_many(actions + _focus_restore_actions(focus_id))
 
-    # Put the active workspace and the focused window back where they were.
-    # Focusing a window that the restore moved elsewhere would switch the
-    # visible workspace, so it is skipped in that case.
-    after_workspaces = snapshot_workspaces()
-    active_workspace = next(
-        (wid for wid, w in after_workspaces.items() if w.get("focused")), None
-    )
-    if original_workspace and active_workspace != original_workspace:
-        ws = ws_map.get(original_workspace)
-        if ws:
-            _send(f"workspace-switch:{workspace_selector(ws)}")
+    # Move anything still on the temporary anchor workspace back to the
+    # original one, then put the original focused window back on the seat.
+    original_ws = ws_map.get(original_workspace or "")
+    _clear_temp_workspace(temp_ws if temp_used else None, original_ws, focus_id)
 
     after_windows = snapshot_windows()
-    active_window = next(
-        (wid for wid, w in after_windows.items() if w.get("active")), None
-    )
-    if original_focus and active_window != original_focus:
-        target_ws = ws_map.get(original_workspace, {}).get("id")
-        if after_windows.get(original_focus, {}).get("workspace") == target_ws:
-            _send(f"window-focus:{original_focus}")
+    if focus_id is not None and focus_id not in after_windows:
+        focus_id = None
+    for _attempt in range(FOCUS_RETRIES):
+        if not focus_id or _active_window(after_windows) == focus_id:
+            break
+        _send_many(_focus_restore_actions(focus_id))
+        time.sleep(0.05)
+        after_windows = snapshot_windows()
+    if focus_id and _active_window(after_windows) != focus_id:
+        log.warning("could not restore focus to %s", focus_id)
+
+    if focus_id is None and original_workspace and original_ws is not None:
+        _send(f"workspace-switch:{workspace_selector(original_ws)}")
 
     matched_ids = set(id(e) for e, _spawned in matched.values())
     for entry in windows:

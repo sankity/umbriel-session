@@ -70,6 +70,11 @@ class TestResolveTargetWorkspace(unittest.TestCase):
         target = resolve_target_workspace(entry, self.ws_map)
         self.assertEqual(target["index"], 3)
 
+    def test_fallback_skips_temporary_workspace(self):
+        entry = _entry("zen", index=9, output="eDP-1")
+        target = resolve_target_workspace(entry, self.ws_map, "eDP-1:6")
+        self.assertEqual(target["index"], 2)
+
     def test_no_workspace_on_output(self):
         entry = _entry("zen", index=1, output="HDMI-A-1")
         self.assertIsNone(resolve_target_workspace(entry, self.ws_map))
