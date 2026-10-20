@@ -56,9 +56,24 @@ def _parse_desktop(content: str) -> tuple[str, str, str] | None:
     if not name or not exec_line:
         return None
     cleaned = _PLACEHOLDER_RE.sub("", exec_line).strip()
+    cleaned = _strip_env(cleaned)
     if not cleaned:
         return None
     return name, cleaned, wm_class or ""
+
+
+def _strip_env(cmd: str) -> str:
+    """Drop a leading `env` and its VAR=value assignments."""
+    parts = cmd.split()
+    if not parts:
+        return cmd
+    if parts[0] == "env":
+        parts = parts[1:]
+        while parts and "=" in parts[0] and not parts[0].startswith("-"):
+            parts = parts[1:]
+    if not parts:
+        return cmd
+    return " ".join(parts)
 
 
 def build_desktop_map() -> dict[str, str]:
@@ -112,6 +127,35 @@ def _exe_command(pid: int) -> str | None:
     return exe.name
 
 
+def _process_cwd(pid: int) -> str | None:
+    try:
+        return str(Path(f"/proc/{pid}/cwd").resolve())
+    except OSError:
+        return None
+
+
+def _absolutize_args(cmd: str, pid: int) -> str:
+    """Make relative path arguments absolute against the process's cwd.
+
+    A relative path only resolves from the directory the app was launched
+    in. Re-spawning the same command elsewhere breaks it.
+    """
+    parts = cmd.split()
+    if len(parts) < 2:
+        return cmd
+    cwd = _process_cwd(pid)
+    if not cwd:
+        return cmd
+    out = [parts[0]]
+    for arg in parts[1:]:
+        if arg.startswith("-") or arg.startswith("/") or "/" not in arg:
+            out.append(arg)
+            continue
+        candidate = Path(cwd) / arg
+        out.append(str(candidate) if candidate.exists() else arg)
+    return " ".join(out)
+
+
 def resolve_command(
     app_id: str,
     pid: int,
@@ -120,18 +164,24 @@ def resolve_command(
 ) -> str | None:
     """Resolve the launch command for a window.
 
-    Order: launch map override, /proc cmdline, /proc exe, desktop map,
-    raw app_id. Returns None when nothing usable is found.
+    Order: launch map override, desktop Exec, /proc cmdline, /proc exe,
+    raw app_id. The desktop entry wins over /proc because an Electron app's
+    cmdline is the raw binary plus whatever path it was opened with, which
+    is not a reliable way to start the app again.
     """
     override = launch_map.get(app_id.lower())
     if override:
         return override
 
+    desktop_cmd = desktop_map.get(app_id.lower())
+    if desktop_cmd:
+        return desktop_cmd
+
     candidates: list[str] = []
     if pid > 0:
         cmdline = _cmdline_command(pid)
         if cmdline:
-            candidates.append(cmdline)
+            candidates.append(_absolutize_args(cmdline, pid))
         exe = _exe_command(pid)
         if exe:
             candidates.append(exe)
@@ -141,8 +191,5 @@ def resolve_command(
         binary = candidate.split()[0] if candidate.split() else ""
         if _which(binary):
             return candidate
-        desktop_cmd = desktop_map.get(app_id.lower())
-        if desktop_cmd:
-            return desktop_cmd
 
     return None

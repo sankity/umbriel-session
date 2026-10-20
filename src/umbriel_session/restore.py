@@ -51,6 +51,18 @@ def snapshot_windows() -> dict[str, dict]:
     return {w["id"]: w for w in data}
 
 
+def snapshot_workspaces() -> dict[str, dict]:
+    """Return current workspaces keyed by their stable id."""
+    result = run_umbriel("workspaces", "--json")
+    if result.returncode != 0:
+        raise RuntimeError(f"umbriel workspaces failed: {result.stderr.strip()}")
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"malformed workspaces output: {exc}") from exc
+    return {w["id"]: w for w in data}
+
+
 def workspace_selector(window: WindowEntry) -> str:
     ref = window.workspace
     if ref.named:
@@ -58,6 +70,18 @@ def workspace_selector(window: WindowEntry) -> str:
             return f"{ref.name}/{ref.output}"
         return f'"{ref.name}"'
     return f"{ref.index}/{ref.output}" if ref.output else str(ref.index)
+
+
+def _ws_key(ws_id: str, ws_map: dict[str, dict]) -> tuple[str, int] | None:
+    """Map a live workspace id to the (output, index) pair a saved entry uses."""
+    ws = ws_map.get(ws_id)
+    if not ws:
+        return None
+    return (ws.get("output", ""), ws.get("index", 0))
+
+
+def _entry_key(entry: WindowEntry) -> tuple[str, int]:
+    return (entry.workspace.output, entry.workspace.index)
 
 
 def _send(action: str) -> bool:
@@ -94,23 +118,77 @@ def _remove_pending(
             return
 
 
-def _apply_window(entry: WindowEntry, window_id: str, cfg: Config) -> None:
-    # silent workspace move targets the focused window: focus first.
-    _send(f"window-focus:{window_id}")
-    selector = workspace_selector(entry)
-    _send(f"window-move-to-workspace-silent:{selector}")
-    if cfg.restore_floating and entry.floating:
+def _pick_window(
+    entry: WindowEntry,
+    live: dict[str, dict],
+    matched: dict[str, WindowEntry],
+    ws_map: dict[str, dict],
+) -> str | None:
+    """Pick the live window that belongs to a saved entry.
+
+    A window already sitting on the entry's workspace is preferred, so the
+    assignment stays stable instead of depending on the order the compositor
+    happens to list windows in.
+    """
+    candidates = [
+        wid
+        for wid, w in live.items()
+        if wid not in matched and w.get("app_id", "") == entry.app_id
+    ]
+    if not candidates:
+        candidates = [
+            wid
+            for wid, w in live.items()
+            if wid not in matched and w.get("title", "") == entry.title
+        ]
+    if not candidates:
+        return None
+    target = _entry_key(entry)
+    for wid in candidates:
+        live_key = _ws_key(live[wid].get("workspace", ""), ws_map)
+        if live_key is not None and live_key == target:
+            return wid
+    return candidates[0]
+
+
+def _apply_window(
+    entry: WindowEntry,
+    window_id: str,
+    current: dict,
+    cfg: Config,
+    ws_map: dict[str, dict],
+) -> None:
+    """Apply the saved state to a live window.
+
+    Focus switches the visible workspace, so it is only used when the state
+    actually needs it: moving the window to its workspace, or a focused-window
+    action (fullscreen/maximize/pin).
+    """
+    live_key = _ws_key(current.get("workspace", ""), ws_map)
+    on_target = live_key is not None and live_key == _entry_key(entry)
+
+    needs_focus = (
+        not on_target
+        or (cfg.restore_fullscreen and entry.fullscreen and not current.get("fullscreen"))
+        or (entry.maximized and not current.get("maximized"))
+        or (entry.pinned and not current.get("pinned"))
+    )
+    if needs_focus:
+        _send(f"window-focus:{window_id}")
+
+    if not on_target:
+        _send(f"window-move-to-workspace-silent:{workspace_selector(entry)}")
+
+    if cfg.restore_floating and entry.floating != current.get("floating", False):
         _send(f"window-toggle-floating:{window_id}")
         _send(f"window-move-to:center/0/0/{window_id}")
-    # maximize/fullscreen/pinned are focused-window actions: focus first.
-    if cfg.restore_fullscreen and entry.fullscreen:
-        _send(f"window-focus:{window_id}")
+
+    # maximize/fullscreen/pinned are focused-window actions.
+    if cfg.restore_fullscreen and entry.fullscreen and not current.get("fullscreen"):
         _send("window-toggle-fullscreen")
-    if entry.maximized:
-        _send(f"window-focus:{window_id}")
+    if entry.maximized and not current.get("maximized"):
         _send("window-toggle-maximize")
-    if entry.pinned:
-        _send(f"window-focus:{window_id}")
+    if entry.pinned and not current.get("pinned"):
         _send("window-toggle-pinned")
 
 
@@ -148,6 +226,10 @@ def restore_session(
 
     before_windows = snapshot_windows()
     before_ids = set(before_windows)
+    try:
+        ws_map = snapshot_workspaces()
+    except RuntimeError:
+        ws_map = {}
     before_app_counts: dict[str, int] = {}
     for w in before_windows.values():
         before_app_counts[w.get("app_id", "")] = before_app_counts.get(
@@ -194,39 +276,30 @@ def restore_session(
     ]
     matched: dict[str, WindowEntry] = {}  # wid -> entry (by identity)
     spawned_app_ids = {entry.app_id for entry, _cmd in spawn_list}
-    # Save the currently focused window so we can restore focus after apply
-    # (apply calls window-focus which shifts the active workspace).
+    # Save the currently focused window and active workspace so we can put
+    # both back after apply (apply calls window-focus which shifts them).
     original_focus = None
-    try:
-        current_before = snapshot_windows()
-        for wid, w in current_before.items():
-            if w.get("focused"):
-                original_focus = wid
-                break
-    except Exception:
-        pass
+    original_workspace = None
+    for wid, w in before_windows.items():
+        if w.get("focused"):
+            original_focus = wid
+            break
+    for wid, w in ws_map.items():
+        if w.get("focused"):
+            original_workspace = wid
+            break
     deadline = time.monotonic() + cfg.load_time
 
-    if adjust_clients_only:
-        # Match existing windows against the saved entries.
+    if adjust_clients_only or not spawned_app_ids:
+        # Nothing to spawn: match the live windows against the saved entries.
         current = snapshot_windows()
-        for wid, window in current.items():
-            hit = _match_window(wid, current, pending)
-            if hit:
-                entry, _cmd = hit
-                matched[wid] = entry
-                _remove_pending(pending, entry)
-                _apply_window(entry, wid, cfg)
-    elif not spawned_app_ids:
-        # All apps already running: skip subscribe, match existing windows.
-        current = snapshot_windows()
-        for wid, window in current.items():
-            hit = _match_window(wid, current, pending)
-            if hit:
-                entry, _cmd = hit
-                matched[wid] = entry
-                _remove_pending(pending, entry)
-                _apply_window(entry, wid, cfg)
+        for entry, _cmd in list(pending):
+            wid = _pick_window(entry, current, matched, ws_map)
+            if wid is None:
+                continue
+            matched[wid] = entry
+            _remove_pending(pending, entry)
+            _apply_window(entry, wid, current[wid], cfg, ws_map)
     else:
         proc = subprocess.Popen(
             [UMBRIEL, "subscribe", "windows"],
@@ -269,7 +342,7 @@ def restore_session(
                         entry, _cmd = hit
                         matched[wid] = entry
                         _remove_pending(pending, entry)
-                        _apply_window(entry, wid, cfg)
+                        _apply_window(entry, wid, by_id[wid], cfg, ws_map)
                 matched_app_ids = {e.app_id for e in matched.values()}
                 if spawned_app_ids and spawned_app_ids <= matched_app_ids:
                     break
@@ -280,30 +353,48 @@ def restore_session(
     # Final pass: match remaining saved entries to existing windows (apps that
     # were already running and didn't spawn a new window). Apply their saved
     # state so already-running apps land on the right workspace.
+    live_now = snapshot_windows()
     for entry, _cmd in list(pending):
-        for wid, w in before_windows.items():
-            if wid in matched:
-                continue
-            if w.get("app_id", "") == entry.app_id:
-                matched[wid] = entry
-                _remove_pending(pending, entry)
-                _apply_window(entry, wid, cfg)
-                break
+        wid = _pick_window(entry, live_now, matched, ws_map)
+        if wid is None:
+            continue
+        matched[wid] = entry
+        _remove_pending(pending, entry)
+        _apply_window(entry, wid, live_now[wid], cfg, ws_map)
 
-    # Restore focus to the window that was focused before restore started.
-    if original_focus:
-        _send(f"window-focus:{original_focus}")
+    # Restore the workspace that was active before restore started.
+    if original_workspace:
+        ws = ws_map.get(original_workspace)
+        if ws:
+            if ws.get("named"):
+                _send(f'workspace-switch:"{ws["name"]}"')
+            else:
+                _send(f'workspace-switch:{ws["index"]}/{ws["output"]}')
 
-    # Focus replay: most-recently-focused window last.
+    # Focus replay. Only the most recently focused window on the active
+    # workspace is focused: focusing a window on another workspace would
+    # switch the visible workspace, and focusing many in a row makes the
+    # focus jump around.
     if cfg.focus_last:
         entry_to_wid = {id(e): wid for wid, e in matched.items()}
         focus_order = sorted(
             windows, key=lambda e: e.focus_order, reverse=True
         )
+        live_after = snapshot_windows()
         for entry in focus_order:
             wid = entry_to_wid.get(id(entry))
-            if wid:
-                _send(f"window-focus:{wid}")
+            if not wid:
+                continue
+            live = live_after.get(wid)
+            if not live:
+                continue
+            if original_workspace and live.get("workspace") != original_workspace:
+                continue
+            _send(f"window-focus:{wid}")
+            break
+
+    if original_focus:
+        _send(f"window-focus:{original_focus}")
 
     # Report: OK only if this exact entry was matched to a window.
     matched_ids = set(id(e) for e in matched.values())
